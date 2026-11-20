@@ -50,11 +50,9 @@ pub struct Buttons {
     confirm_off: bool,
     board: Option<Board>,
     layouts: Vec<(Layout, String)>,
-    active: Layout,
     shape_override: Option<Shape>,
     layout_override: Option<Layout>,
-    /// Layouts and overrides are re-read only when the view changes; a layout switch is itself a
-    /// key press, so it moves the fingerprint.
+    /// Installed layouts and overrides are re-read only when the view changes.
     checked: Option<Fingerprint>,
 }
 
@@ -67,7 +65,6 @@ impl Buttons {
             confirm_off: false,
             board: None,
             layouts: Vec::new(),
-            active: Layout(0),
             shape_override: None,
             layout_override: None,
             checked: None,
@@ -196,7 +193,6 @@ impl Buttons {
         {
             self.layouts = installed.into_iter().map(|l| (l, l.name())).collect();
         }
-        self.active = Layout::active();
         let (shape, layout) = settings::read(|s| {
             (
                 s.key_shape,
@@ -213,7 +209,8 @@ impl Buttons {
             self.checked = Some(key);
             self.refresh_layouts();
         }
-        let active = self.active;
+        // Every frame: Windows applies a layout switch on key release, which moves no count.
+        let active = Layout::active();
         let guessed = keyboard::guess_shape(self.layout_override.unwrap_or(active).langid());
         let name = |l: Layout| {
             self.layouts

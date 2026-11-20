@@ -237,11 +237,13 @@ pub fn turn_on() {
 }
 
 /// Keeping saves the presses made while it was on; deleting drops them unsaved, so nothing is
-/// written just before the delete.
+/// written just before the delete. The flag drops under the store lock, so a flush running at the
+/// same time either saves the pending presses first or finds them already taken.
 pub fn turn_off(delete: bool) {
+    let store = store();
     ENABLED.store(false, Ordering::Relaxed);
     let taken = take_pending();
-    if let Some(mut store) = store() {
+    if let Some(mut store) = store {
         if delete {
             let _ = store.delete();
         } else {
