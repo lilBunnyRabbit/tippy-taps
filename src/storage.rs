@@ -253,7 +253,7 @@ impl Storage {
             .filter_map(|e| {
                 let name = e.file_name();
                 let stem = name.to_str()?.strip_suffix(".json")?;
-                Month::parse(stem.strip_suffix(SPLIT_SUFFIX).unwrap_or(stem))
+                Month::parse(stem.split('.').next()?)
             })
             .collect();
         for month in months {
@@ -378,7 +378,8 @@ fn split_month(dir: &Path, month: Month, stamp: &str, moved: &mut Vec<PathBuf>) 
     let shard = dir.join(format!("{month}.json"));
     let journal = dir.join(format!("{month}{SPLIT_SUFFIX}.json"));
     if !shard.exists() {
-        return remove_if_exists(&journal);
+        remove_if_exists(&journal)?;
+        return mark_recovered(damaged_journals(dir, month)?);
     }
     let resumed = load_shard(&journal, month, stamp)?;
     moved.extend(resumed.moved_to);
@@ -434,6 +435,10 @@ fn split_month(dir: &Path, month: Month, stamp: &str, moved: &mut Vec<PathBuf>) 
     }
     std::fs::rename(&shard, free_backup(dir, month, stamp))?;
     remove_if_exists(&journal)?;
+    mark_recovered(damaged)
+}
+
+fn mark_recovered(damaged: Vec<PathBuf>) -> io::Result<()> {
     for path in damaged {
         std::fs::rename(&path, path.with_extension("json.recovered"))?;
     }
@@ -1179,6 +1184,18 @@ mod tests {
         assert!(
             dir.0
                 .join("2026-11.split.corrupt-x.json.recovered")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn damaged_journal_of_a_finished_month_is_marked_recovered() {
+        let dir = TempDir::new("split-bad-journal-done");
+        std::fs::write(dir.0.join("2026-11.split.corrupt-a.json"), "{ torn").unwrap();
+        open(&dir);
+        assert!(
+            dir.0
+                .join("2026-11.split.corrupt-a.json.recovered")
                 .exists()
         );
     }
