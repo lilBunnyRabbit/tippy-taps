@@ -156,19 +156,6 @@ impl eframe::App for App {
             self.revealed = false;
             hide(ctx);
         }
-        if shown() {
-            for m in milestones::take_queued() {
-                self.fireworks.launch(m.label());
-            }
-        }
-        if self.fireworks.active() {
-            let area = ctx.content_rect();
-            self.fireworks.step(ctx.input(|i| i.stable_dt), area);
-            let painter =
-                ctx.layer_painter(LayerId::new(Order::Foreground, Id::unique("fireworks")));
-            self.fireworks.paint(&painter, area, BRAND_DARKER);
-            ctx.request_repaint();
-        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -181,10 +168,31 @@ impl eframe::App for App {
                     self.content(ui, &stats);
                 });
             });
+        self.play_fireworks(ui.ctx());
     }
 }
 
 impl App {
+    /// Plays only while the window is on screen; a show cut short by closing or minimising
+    /// pauses and resumes when the window is back.
+    fn play_fireworks(&mut self, ctx: &egui::Context) {
+        let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+        if !shown() || minimized {
+            return;
+        }
+        for m in milestones::take_queued() {
+            self.fireworks.launch(m.label());
+        }
+        if self.fireworks.active() {
+            let area = ctx.content_rect();
+            self.fireworks.step(ctx.input(|i| i.stable_dt), area);
+            let painter =
+                ctx.layer_painter(LayerId::new(Order::Foreground, Id::unique("fireworks")));
+            self.fireworks.paint(&painter, area, BRAND_DARKER);
+            ctx.request_repaint();
+        }
+    }
+
     fn content(&mut self, ui: &mut egui::Ui, stats: &Stats) {
         ui.label(
             RichText::new("Tippy Taps")
