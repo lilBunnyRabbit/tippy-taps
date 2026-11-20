@@ -10,21 +10,22 @@ use eframe::egui::{
 
 use windows::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};
 
+use crate::buttons::Buttons;
 use crate::clock::{self, Date, Hour};
 use crate::counts::{self, Bucket, duration, group, scroll_distance};
 use crate::fireworks::Fireworks;
 use crate::stats::{self, CALENDAR_WEEKS, Period, Stats};
-use crate::{autostart, hooks, milestones, settings, storage, tray};
+use crate::{autostart, hooks, keyboard, milestones, settings, storage, tray};
 
-const BRAND_DARKER: Color32 = Color32::from_rgb(0x0b, 0x15, 0x19);
+pub(crate) const BRAND_DARKER: Color32 = Color32::from_rgb(0x0b, 0x15, 0x19);
 const BRAND_BG: Color32 = Color32::from_rgb(0x17, 0x25, 0x2c);
-const BRAND_BG_LIGHT: Color32 = Color32::from_rgb(0x1d, 0x2e, 0x36);
-const BRAND_BG_LIGHTEST: Color32 = Color32::from_rgb(0x2a, 0x40, 0x4a);
-const BRAND_FG: Color32 = Color32::from_rgb(0xb1, 0xab, 0xa8);
-const BRAND_FG_WEAK: Color32 = Color32::from_rgb(0x7d, 0x80, 0x7f);
+pub(crate) const BRAND_BG_LIGHT: Color32 = Color32::from_rgb(0x1d, 0x2e, 0x36);
+pub(crate) const BRAND_BG_LIGHTEST: Color32 = Color32::from_rgb(0x2a, 0x40, 0x4a);
+pub(crate) const BRAND_FG: Color32 = Color32::from_rgb(0xb1, 0xab, 0xa8);
+pub(crate) const BRAND_FG_WEAK: Color32 = Color32::from_rgb(0x7d, 0x80, 0x7f);
 const BRAND_PRIMARY: Color32 = Color32::from_rgb(0xa4, 0xb4, 0x83);
 const BRAND_PRIMARY_TINT: Color32 = Color32::from_rgb(0x2a, 0x37, 0x31);
-const BRAND_COTTONTAIL: Color32 = Color32::from_rgb(0xe3, 0xf9, 0xb2);
+pub(crate) const BRAND_COTTONTAIL: Color32 = Color32::from_rgb(0xe3, 0xf9, 0xb2);
 const BRAND_WARNING: Color32 = Color32::from_rgb(0xe4, 0x9b, 0x39);
 const BRAND_ERROR: Color32 = Color32::from_rgb(0xf8, 0x88, 0x76);
 const CHANGE_CHECK: Duration = Duration::from_millis(500);
@@ -59,10 +60,15 @@ pub fn shown() -> bool {
     SHOWN.load(Ordering::Relaxed)
 }
 
-type Fingerprint = (u64, Hour, Bucket);
+type Fingerprint = (u64, Hour, Bucket, u64);
 
 fn fingerprint() -> Fingerprint {
-    (storage::revision(), clock::now_hour(), counts::pending())
+    (
+        storage::revision(),
+        clock::now_hour(),
+        counts::pending(),
+        keyboard::revision(),
+    )
 }
 
 /// Wakes egui only when something on screen changed, and parks while the window is hidden, so
@@ -104,10 +110,17 @@ fn trim_working_set() {
     }
 }
 
+struct View {
+    key: Fingerprint,
+    stats: Stats,
+    keys: Box<keyboard::Counts>,
+}
+
 pub struct App {
     period: Period,
     revealed: bool,
-    stats: Option<(Fingerprint, Stats)>,
+    view: Option<View>,
+    buttons: Buttons,
     pinned_hour: Option<(usize, usize)>,
     pinned_day: Option<(usize, usize)>,
     fireworks: Fireworks,
@@ -124,7 +137,8 @@ impl App {
         Self {
             period: Period::Day,
             revealed: false,
-            stats: None,
+            view: None,
+            buttons: Buttons::new(),
             pinned_hour: None,
             pinned_day: None,
             fireworks: Fireworks::new(
@@ -134,14 +148,24 @@ impl App {
         }
     }
 
-    fn stats(&mut self) -> &Stats {
+    /// Recomputed only when the fingerprint moves, not every frame.
+    fn take_view(&mut self) -> View {
         let key = fingerprint();
-        if self.stats.as_ref().is_none_or(|(k, _)| *k != key) {
-            let storage = storage::get();
-            let stats = stats::compute(&storage.hours, storage.total, key.2, key.1);
-            self.stats = Some((key, stats));
+        match self.view.take() {
+            Some(view) if view.key == key => view,
+            _ => {
+                let stats = {
+                    let storage = storage::get();
+                    stats::compute(&storage.hours, storage.total, key.2, key.1)
+                };
+                let keys = if keyboard::enabled() {
+                    keyboard::counts()
+                } else {
+                    Box::new([0; keyboard::SLOTS])
+                };
+                View { key, stats, keys }
+            }
         }
-        &self.stats.as_ref().expect("just set").1
     }
 }
 
@@ -159,15 +183,20 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let stats = self.stats().clone();
+        let view = self.take_view();
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 egui::Frame::new().inner_margin(16).show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    self.content(ui, &stats);
+                    self.content(ui, &view.stats);
+                    ui.add_space(12.0);
+                    self.buttons.show(ui, &view.stats, &view.keys);
+                    ui.add_space(12.0);
+                    self.footer(ui);
                 });
             });
+        self.view = Some(view);
         self.play_fireworks(ui.ctx());
     }
 }
@@ -302,8 +331,9 @@ impl App {
                 format!("{} · {}", day_label(date), totals(stats.days[day(pos)]))
             }),
         );
-        ui.add_space(12.0);
+    }
 
+    fn footer(&self, ui: &mut egui::Ui) {
         let mut on = autostart::enabled();
         if ui.checkbox(&mut on, "Start with Windows").changed() {
             let _ = autostart::set(on);
@@ -327,25 +357,31 @@ impl App {
                 storage.error.clone(),
             )
         };
-        for text in [notice, error, settings::error()].into_iter().flatten() {
+        for text in [notice, error, settings::error()]
+            .into_iter()
+            .flatten()
+            .chain(keyboard::messages())
+        {
             ui.colored_label(BRAND_WARNING, text);
         }
         if let Some(err) = hooks::error() {
             ui.colored_label(BRAND_ERROR, err);
         }
-        weak(
-            ui,
-            format!("Counts only, never which keys. Stored locally at {dir}."),
-        );
+        let privacy = if keyboard::enabled() {
+            "Counts only, plus presses per key position. Never what you typed, the order, or when."
+        } else {
+            "Counts only, never which keys."
+        };
+        weak(ui, format!("{privacy} Stored locally at {dir}."));
     }
 }
 
-fn caption(ui: &mut egui::Ui, text: &str) {
+pub(crate) fn caption(ui: &mut egui::Ui, text: &str) {
     ui.label(RichText::new(text).small().strong().color(BRAND_FG_WEAK));
     ui.add_space(2.0);
 }
 
-fn weak(ui: &mut egui::Ui, text: String) {
+pub(crate) fn weak(ui: &mut egui::Ui, text: String) {
     ui.label(RichText::new(text).small().color(BRAND_FG_WEAK));
 }
 
@@ -438,7 +474,7 @@ fn month_labels(start: Date) -> Vec<(usize, String)> {
         .collect()
 }
 
-fn heat(value: u64, max: u64) -> Color32 {
+pub(crate) fn heat(value: u64, max: u64) -> Color32 {
     if value == 0 || max == 0 {
         return BRAND_BG_LIGHT;
     }

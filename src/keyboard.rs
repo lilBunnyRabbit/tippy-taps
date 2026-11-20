@@ -17,6 +17,12 @@ pub type Counts = [u64; SLOTS];
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static PENDING: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+/// Bumped when counts drop outside a flush (opt-out, delete), so cached views refresh.
+static REVISION: AtomicU64 = AtomicU64::new(0);
+
+pub fn revision() -> u64 {
+    REVISION.load(Ordering::Relaxed)
+}
 
 pub fn slot(scan: u32, extended: bool) -> usize {
     (scan & 0xff) as usize | if extended { 0x100 } else { 0 }
@@ -214,8 +220,14 @@ pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
+/// Turning off keeps the presses made while it was on: they are saved before the flag drops them.
 pub fn set_enabled(on: bool) {
     ENABLED.store(on, Ordering::Relaxed);
+    if !on && let Some(mut store) = store() {
+        let taken = take_pending();
+        store.flush(&taken, true, &LocalTime::now().stamp());
+    }
+    REVISION.fetch_add(1, Ordering::Relaxed);
     settings::update(|s| s.key_heatmap = on);
 }
 
@@ -224,6 +236,7 @@ pub fn delete() {
     if let Some(mut store) = store() {
         let _ = store.delete();
     }
+    REVISION.fetch_add(1, Ordering::Relaxed);
 }
 
 pub fn flush() {
