@@ -158,7 +158,7 @@ Hook cost stays inside the performance budget. On `WM_MOUSEMOVE` (not injected) 
   - Records: busiest hour, day, week ever, with date.
   - Streaks: current and longest run of active days.
   - Active time: hours with any input per day.
-  - Day shape: first and last active hour per day as a range chart.
+  - Day shape: typical-day strip (median start and end, follows the 30/90/365 picker) plus the last 7 days one row each (owner found the per-day range chart hard to read). Active time shown as the average per active day.
   - Weekday averages Mon…Sun.
   - Keys per click ratio.
   - Keyboard heatmap users only: backspace rate (backspace ÷ all keys), left vs right hand split by key position, top 10 keys.
