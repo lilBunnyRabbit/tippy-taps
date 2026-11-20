@@ -60,7 +60,7 @@ pub fn shown() -> bool {
     SHOWN.load(Ordering::Relaxed)
 }
 
-type Fingerprint = (u64, Hour, Bucket, u64);
+pub(crate) type Fingerprint = (u64, Hour, Bucket, u64);
 
 fn fingerprint() -> Fingerprint {
     (
@@ -191,7 +191,7 @@ impl eframe::App for App {
                     ui.set_width(ui.available_width());
                     self.content(ui, &view.stats);
                     ui.add_space(12.0);
-                    self.buttons.show(ui, &view.stats, &view.keys);
+                    self.buttons.show(ui, &view.stats, &view.keys, view.key);
                     ui.add_space(12.0);
                     self.footer(ui);
                 });

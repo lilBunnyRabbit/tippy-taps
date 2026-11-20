@@ -304,7 +304,22 @@ pub fn labels(keys: &[Key], hkl: Layout) -> Vec<String> {
         .collect()
 }
 
-pub fn key_name(slot: usize) -> String {
+/// Character keys are named by their legend from the chosen layout; `GetKeyNameTextW` would use
+/// the UI thread's layout instead.
+pub fn names(keys: &[Key], labels: &[String]) -> Vec<String> {
+    keys.iter()
+        .zip(labels)
+        .map(|(key, label)| {
+            if is_character(key.slot) && !label.is_empty() {
+                label.clone()
+            } else {
+                key_name(key.slot)
+            }
+        })
+        .collect()
+}
+
+fn key_name(slot: usize) -> String {
     let lparam = ((slot & 0xff) << 16 | (slot & 0x100) << 16) as i32;
     let mut buf = [0u16; 64];
     let len = unsafe { GetKeyNameTextW(lparam, &mut buf) };

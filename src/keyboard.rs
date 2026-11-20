@@ -11,6 +11,7 @@ use crate::{settings, storage};
 
 pub const SLOTS: usize = 512;
 const FILE_NAME: &str = "keys.json";
+const CORRUPT_PREFIX: &str = "keys.corrupt-";
 const VERSION: u32 = 1;
 
 pub type Counts = [u64; SLOTS];
@@ -168,20 +169,29 @@ impl Store {
         }
     }
 
+    /// Also removes copies moved aside as unreadable, which hold per-key counts too.
     fn delete(&mut self) -> io::Result<()> {
         *self.totals = [0; SLOTS];
         self.dirty = false;
-        match std::fs::remove_file(&self.path) {
-            Err(err) if err.kind() != ErrorKind::NotFound => {
-                self.error = Some(format!("Can't delete {}: {err}", self.path.display()));
-                Err(err)
-            }
-            _ => {
-                self.loaded = true;
-                self.error = None;
-                Ok(())
+        let mut paths = vec![self.path.clone()];
+        if let Some(entries) = self.path.parent().and_then(|d| std::fs::read_dir(d).ok()) {
+            paths.extend(entries.flatten().map(|e| e.path()).filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(CORRUPT_PREFIX) && n.ends_with(".json"))
+            }));
+        }
+        for path in paths {
+            if let Err(err) = std::fs::remove_file(&path)
+                && err.kind() != ErrorKind::NotFound
+            {
+                self.error = Some(format!("Can't delete {}: {err}", path.display()));
+                return Err(err);
             }
         }
+        self.loaded = true;
+        self.error = None;
+        Ok(())
     }
 }
 
@@ -220,23 +230,26 @@ pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
-/// Turning off keeps the presses made while it was on: they are saved before the flag drops them.
-pub fn set_enabled(on: bool) {
-    ENABLED.store(on, Ordering::Relaxed);
-    if !on && let Some(mut store) = store() {
-        let taken = take_pending();
-        store.flush(&taken, true, &LocalTime::now().stamp());
-    }
+pub fn turn_on() {
+    ENABLED.store(true, Ordering::Relaxed);
     REVISION.fetch_add(1, Ordering::Relaxed);
-    settings::update(|s| s.key_heatmap = on);
+    settings::update(|s| s.key_heatmap = true);
 }
 
-pub fn delete() {
-    take_pending();
+/// Keeping saves the presses made while it was on; deleting drops them unsaved, so nothing is
+/// written just before the delete.
+pub fn turn_off(delete: bool) {
+    ENABLED.store(false, Ordering::Relaxed);
+    let taken = take_pending();
     if let Some(mut store) = store() {
-        let _ = store.delete();
+        if delete {
+            let _ = store.delete();
+        } else {
+            store.flush(&taken, true, &LocalTime::now().stamp());
+        }
     }
     REVISION.fetch_add(1, Ordering::Relaxed);
+    settings::update(|s| s.key_heatmap = false);
 }
 
 pub fn flush() {
@@ -339,9 +352,15 @@ mod tests {
         let mut store = Store::open(path.clone(), "s");
         store.flush(&taps(&[(0x10, 7)]), true, "s");
         assert!(path.exists());
+        let moved_aside = dir.join("keys.corrupt-20261101-090000.json");
+        let shard = dir.join("2026-11.json");
+        std::fs::write(&moved_aside, "{}").unwrap();
+        std::fs::write(&shard, "{}").unwrap();
 
         store.delete().unwrap();
         assert!(!path.exists());
+        assert!(!moved_aside.exists(), "moved-aside per-key counts go too");
+        assert!(shard.exists(), "month shards are not touched");
         assert!(store.totals.iter().all(|n| *n == 0));
         store.flush(&taps(&[(0x10, 1)]), false, "s");
         assert!(!path.exists(), "a press racing the opt-out is dropped");

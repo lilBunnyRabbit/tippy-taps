@@ -10,7 +10,7 @@ use crate::settings;
 use crate::stats::{Period, Stats};
 use crate::ui::{
     BRAND_BG_LIGHT, BRAND_BG_LIGHTEST, BRAND_COTTONTAIL, BRAND_DARKER, BRAND_FG, BRAND_FG_WEAK,
-    caption, heat, weak,
+    Fingerprint, caption, heat, weak,
 };
 
 const KEYS_LINE: &str =
@@ -36,7 +36,10 @@ struct Board {
     shape: Shape,
     layout: Layout,
     keys: Vec<Key>,
-    labels: Vec<String>,
+    parts: Vec<Part>,
+    names: Vec<String>,
+    total: u64,
+    counted: Option<Fingerprint>,
 }
 
 pub struct Buttons {
@@ -47,6 +50,12 @@ pub struct Buttons {
     confirm_off: bool,
     board: Option<Board>,
     layouts: Vec<(Layout, String)>,
+    active: Layout,
+    shape_override: Option<Shape>,
+    layout_override: Option<Layout>,
+    /// Layouts and overrides are re-read only when the view changes; a layout switch is itself a
+    /// key press, so it moves the fingerprint.
+    checked: Option<Fingerprint>,
 }
 
 impl Buttons {
@@ -58,10 +67,14 @@ impl Buttons {
             confirm_off: false,
             board: None,
             layouts: Vec::new(),
+            active: Layout(0),
+            shape_override: None,
+            layout_override: None,
+            checked: None,
         }
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, stats: &Stats, keys: &Counts) {
+    pub fn show(&mut self, ui: &mut egui::Ui, stats: &Stats, keys: &Counts, key: Fingerprint) {
         caption(ui, "BUTTONS");
         ui.horizontal(|ui| {
             for (device, label) in [
@@ -79,7 +92,7 @@ impl Buttons {
         });
         ui.add_space(6.0);
         match self.device {
-            Device::Keyboard => self.keyboard(ui, keys),
+            Device::Keyboard => self.keyboard(ui, keys, key),
             Device::Mouse | Device::Controller => {
                 self.range_picker(ui);
                 let b = match self.range {
@@ -88,20 +101,10 @@ impl Buttons {
                 };
                 ui.add_space(6.0);
                 if self.device == Device::Mouse {
-                    let hovered = diagram(
-                        ui,
-                        MOUSE_UNITS,
-                        16.0,
-                        &mouse(b),
-                        &MOUSE_BODY,
-                        &mut self.pinned,
-                    );
-                    self.detail(
-                        ui,
-                        &mouse(b),
-                        hovered,
-                        "Hover or click a button for its count",
-                    );
+                    let parts = mouse(b);
+                    let hovered =
+                        diagram(ui, MOUSE_UNITS, 16.0, &parts, &MOUSE_BODY, &mut self.pinned);
+                    self.detail(ui, &parts, hovered, "Hover or click a button for its count");
                 } else {
                     let parts = controller(b);
                     let hovered = diagram(ui, PAD_UNITS, 22.0, &parts, &PAD_BODY, &mut self.pinned);
@@ -136,11 +139,11 @@ impl Buttons {
         weak(ui, text);
     }
 
-    fn keyboard(&mut self, ui: &mut egui::Ui, counts: &Counts) {
+    fn keyboard(&mut self, ui: &mut egui::Ui, counts: &Counts, key: Fingerprint) {
         let mut on = keyboard::enabled();
         if ui.checkbox(&mut on, "Count presses per key").changed() {
             if on {
-                keyboard::set_enabled(true);
+                keyboard::turn_on();
             } else {
                 self.confirm_off = true;
             }
@@ -153,50 +156,36 @@ impl Buttons {
             return;
         }
         ui.add_space(6.0);
-        self.layout_pickers(ui);
+        self.layout_pickers(ui, key);
         ui.add_space(6.0);
 
-        let board = self.board.as_ref().expect("layout_pickers sets the board");
-        let value = |key: &Key| counts[key.slot] + key.alias.map_or(0, |a| counts[a]);
-        let parts: Vec<Part> = board
-            .keys
-            .iter()
-            .zip(&board.labels)
-            .map(|(key, label)| Part {
-                rect: Rect::from_min_size(pos2(key.x, key.y), vec2(key.w, key.h)),
-                corners: [KEY_CORNER; 4],
-                label: label.clone(),
-                value: value(key),
-                detail: String::new(),
-            })
-            .collect();
+        let board = self.board.as_mut().expect("layout_pickers sets the board");
+        if board.counted != Some(key) {
+            board.counted = Some(key);
+            board.total = 0;
+            for ((part, k), name) in board.parts.iter_mut().zip(&board.keys).zip(&board.names) {
+                part.value = counts[k.slot] + k.alias.map_or(0, |a| counts[a]);
+                part.detail = presses(name, part.value);
+                board.total += part.value;
+            }
+        }
         let hovered = diagram(
             ui,
             vec2(BOARD_WIDTH, BOARD_HEIGHT),
             40.0,
-            &parts,
+            &board.parts,
             &[],
             &mut self.pinned,
         );
-        let text = match hovered.or(self.pinned).and_then(|i| board.keys.get(i)) {
-            Some(key) => format!(
-                "{}: {} presses",
-                layout::key_name(key.slot),
-                group(value(key))
-            ),
-            None => {
-                let total: u64 = board.keys.iter().map(value).sum();
-                format!(
-                    "{} presses on this board, all time. Hover or click a key for its count.",
-                    group(total)
-                )
-            }
-        };
-        weak(ui, text);
+        let hint = format!(
+            "{} presses on this board, all time. Hover or click a key for its count.",
+            group(board.total)
+        );
+        let board = self.board.as_ref().expect("set above");
+        self.detail(ui, &board.parts, hovered, &hint);
     }
 
-    /// Rebuilds the board only when its shape or labels changed.
-    fn layout_pickers(&mut self, ui: &mut egui::Ui) {
+    fn refresh_layouts(&mut self) {
         let installed = Layout::installed();
         if self.layouts.len() != installed.len()
             || self
@@ -207,24 +196,33 @@ impl Buttons {
         {
             self.layouts = installed.into_iter().map(|l| (l, l.name())).collect();
         }
-        let active = Layout::active();
-        let (shape_override, layout_override) = settings::read(|s| {
+        self.active = Layout::active();
+        let (shape, layout) = settings::read(|s| {
             (
                 s.key_shape,
                 s.key_layout.as_deref().and_then(Layout::from_setting),
             )
         });
-        let layout_override = layout_override.filter(|l| self.layouts.iter().any(|(x, _)| x == l));
-        let guessed = keyboard::guess_shape(layout_override.unwrap_or(active).langid());
+        self.shape_override = shape;
+        self.layout_override = layout.filter(|l| self.layouts.iter().any(|(x, _)| x == l));
+    }
 
+    /// Rebuilds the board only when its shape or labels changed.
+    fn layout_pickers(&mut self, ui: &mut egui::Ui, key: Fingerprint) {
+        if self.checked != Some(key) {
+            self.checked = Some(key);
+            self.refresh_layouts();
+        }
+        let active = self.active;
+        let guessed = keyboard::guess_shape(self.layout_override.unwrap_or(active).langid());
         let name = |l: Layout| {
             self.layouts
                 .iter()
                 .find(|(x, _)| *x == l)
                 .map_or_else(|| l.name(), |(_, n)| n.clone())
         };
-        let mut shape_choice = shape_override;
-        let mut layout_choice = layout_override;
+        let mut shape_choice = self.shape_override;
+        let mut layout_choice = self.layout_override;
         ui.horizontal(|ui| {
             ui.label("Shape");
             egui::ComboBox::from_id_salt("key-shape")
@@ -257,11 +255,13 @@ impl Buttons {
                     }
                 });
         });
-        if shape_choice != shape_override || layout_choice != layout_override {
+        if shape_choice != self.shape_override || layout_choice != self.layout_override {
             settings::update(|s| {
                 s.key_shape = shape_choice;
                 s.key_layout = layout_choice.map(Layout::to_setting);
             });
+            self.shape_override = shape_choice;
+            self.layout_override = layout_choice;
             self.pinned = None;
         }
         let layout = layout_choice.unwrap_or(active);
@@ -273,11 +273,26 @@ impl Buttons {
         {
             let keys = layout::board(shape);
             let labels = layout::labels(&keys, layout);
+            let names = layout::names(&keys, &labels);
+            let parts = keys
+                .iter()
+                .zip(labels)
+                .map(|(k, label)| Part {
+                    rect: Rect::from_min_size(pos2(k.x, k.y), vec2(k.w, k.h)),
+                    corners: [KEY_CORNER; 4],
+                    label,
+                    value: 0,
+                    detail: String::new(),
+                })
+                .collect();
             self.board = Some(Board {
                 shape,
                 layout,
                 keys,
-                labels,
+                parts,
+                names,
+                total: 0,
+                counted: None,
             });
         }
     }
@@ -295,12 +310,11 @@ impl Buttons {
             let mut done = false;
             ui.horizontal(|ui| {
                 if ui.button("Turn off and delete").clicked() {
-                    keyboard::set_enabled(false);
-                    keyboard::delete();
+                    keyboard::turn_off(true);
                     done = true;
                 }
                 if ui.button("Turn off, keep").clicked() {
-                    keyboard::set_enabled(false);
+                    keyboard::turn_off(false);
                     done = true;
                 }
                 if ui.button("Cancel").clicked() {
