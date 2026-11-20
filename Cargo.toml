@@ -1,6 +1,6 @@
 [package]
 name = "tippy-taps"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Offline keystroke, click and scroll counter that starts with Windows"
 license = "MIT"
