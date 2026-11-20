@@ -81,6 +81,18 @@ Requester asks for: hour/day/week/month counters, time-of-day stats, a gross tot
 - Optional corner overlay rabbit, off by default, toggled from the tray. It is always on top, clicks pass through it, and it is transparent like looking-glass. A "Move rabbit" tray item unlocks it for dragging, and its position persists.
 - The app icon becomes the rabbit.
 
+## Performance budget (owner, 2026-11-20: "tracking should have basically 0 impact on the pc")
+
+Every design choice must meet these:
+- **Idle (window hidden, no controller):** ~0% CPU. The only periodic wakeups are the flush timer and the tooltip refresh, and both skip their work when nothing changed. No busy loops and no fixed-rate repaint.
+- **Hooks:** the callback does atomic increments plus `CallNextHookEx` and nothing else: no allocation, no locks, no syscalls.
+- **Controller:** poll fast (~125 Hz) only while a controller is connected. With none connected, don't poll: probe the slots on `WM_DEVICECHANGE` (the hook thread's or a message-only window), plus a slow fallback probe every 10 s.
+- **Disk:** write only when counts changed, so an idle PC writes nothing. Shard storage by month (`counts/YYYY-MM.json`, same bucket format), so a flush rewrites only the current month (~70 KB max), not the whole history.
+- **Window:** repaint on data change at most ~2 Hz while visible, never while hidden. Compute heatmap and period aggregates when the data changes, not every frame. Animations (fireworks, rabbit) repaint only while they're playing.
+- **Overlay rabbit:** repaints are driven by input events and capped at ~30 fps, with zero repaints when idle.
+- **Memory:** aim for < 50 MB working set with the window hidden.
+- **Measure it:** report idle CPU % (Task Manager or `Get-Process` CPU delta over 60 s) and the working set, hidden and visible, in the task report.
+
 ## Done when
 
 - `cargo build --release --locked` and `cargo clippy -- -D warnings` pass.
