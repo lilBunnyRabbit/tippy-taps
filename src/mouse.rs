@@ -1,5 +1,6 @@
 use std::cell::Cell;
 use std::collections::BTreeMap;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -11,7 +12,9 @@ use windows::Win32::Devices::Display::{
     DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME, DisplayConfigGetDeviceInfo,
     GetDisplayConfigBufferSizes, QDC_ONLY_ACTIVE_PATHS, QueryDisplayConfig,
 };
-use windows::Win32::Foundation::{ERROR_SUCCESS, HWND, LPARAM, LRESULT, RECT, TRUE, WPARAM};
+use windows::Win32::Foundation::{
+    ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HWND, LPARAM, LRESULT, RECT, TRUE, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::{
     DISPLAY_DEVICE_ACTIVE, DISPLAY_DEVICEW, EnumDisplayDevicesW, EnumDisplayMonitors,
     GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
@@ -468,8 +471,9 @@ impl Store {
             .collect()
     }
 
-    /// Takes every slot's whole array: an add that passed the hook's check just before a
-    /// rewrite can land in a slot or cell the new table no longer has, and is dropped here.
+    /// Reads every slot's whole array. An add that passed the hook's check just before a rewrite
+    /// is booked on whichever monitor now holds its slot, or dropped when that slot or cell is
+    /// gone: at most one event per display change.
     fn drain(&mut self) {
         for slot in 0..MAX_MONITORS {
             let mut monitor = self.live.get(slot).and_then(|id| self.monitors.get_mut(id));
@@ -480,6 +484,10 @@ impl Store {
                     &CLICKS[slot]
                 };
                 for (i, p) in pending.iter().enumerate() {
+                    // A plain load first, so idle slots stay clean, untouched pages.
+                    if p.load(Ordering::Relaxed) == 0 {
+                        continue;
+                    }
                     let taken = p.swap(0, Ordering::Relaxed);
                     let cell = monitor.as_mut().and_then(|m| {
                         let cells = if layer == 0 {
@@ -530,7 +538,13 @@ impl Store {
         }
         if !self.loaded {
             // Loading can change a live monitor's grid size, so the hook must not add meanwhile.
-            self.rewrite(|s| s.try_load(stamp));
+            // A file that still can't be opened skips the rewrite, which would cost a move delta.
+            match std::fs::File::open(&self.path) {
+                Err(err) if err.kind() != ErrorKind::NotFound => {
+                    self.error = Some(format!("Can't open {}: {err}", self.path.display()));
+                }
+                _ => self.rewrite(|s| s.try_load(stamp)),
+            }
         }
         if self.loaded {
             let file = File {
@@ -631,8 +645,14 @@ pub fn snapshot() -> Vec<Screen> {
 
 /// `reset` starts a new epoch even when nothing changed, as after a resume from sleep.
 fn refresh(reset: bool) {
-    let displays = displays();
+    let mut displays = displays();
     let Some(mut store) = store() else { return };
+    // A name lookup that failed mid display change keeps the name already known.
+    for d in &mut displays {
+        if d.name.is_none() {
+            d.name = store.monitors.get(&d.id).and_then(|m| m.name.clone());
+        }
+    }
     if reset || store.differs(&displays) {
         store.publish(&displays);
     }
@@ -680,27 +700,34 @@ struct Named {
 /// The EDID model names ("DELL U2720Q") that `EnumDisplayDevicesW` reports only as "Generic PnP
 /// Monitor".
 fn friendly_names() -> Vec<Named> {
-    let (mut path_count, mut mode_count) = (0, 0);
-    let sized = unsafe {
-        GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count)
-    };
-    if sized != ERROR_SUCCESS {
-        return Vec::new();
-    }
-    let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
-    let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
-    let queried = unsafe {
-        QueryDisplayConfig(
-            QDC_ONLY_ACTIVE_PATHS,
-            &mut path_count,
-            paths.as_mut_ptr(),
-            &mut mode_count,
-            modes.as_mut_ptr(),
-            None,
-        )
-    };
-    if queried != ERROR_SUCCESS {
-        return Vec::new();
+    // The configuration can change between sizing and querying; Microsoft's docs say to retry.
+    let mut paths = Vec::new();
+    let mut path_count = 0;
+    for _ in 0..3 {
+        let mut mode_count = 0;
+        if unsafe {
+            GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count)
+        } != ERROR_SUCCESS
+        {
+            return Vec::new();
+        }
+        paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
+        let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
+        let queried = unsafe {
+            QueryDisplayConfig(
+                QDC_ONLY_ACTIVE_PATHS,
+                &mut path_count,
+                paths.as_mut_ptr(),
+                &mut mode_count,
+                modes.as_mut_ptr(),
+                None,
+            )
+        };
+        match queried {
+            ERROR_SUCCESS => break,
+            ERROR_INSUFFICIENT_BUFFER => paths.clear(),
+            _ => return Vec::new(),
+        }
     }
     paths.truncate(path_count as usize);
     paths
