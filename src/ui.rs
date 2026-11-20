@@ -147,12 +147,17 @@ fn spawn_watcher(ctx: egui::Context) {
                     continue;
                 }
                 trimmed = false;
+                // Restoring a minimized window repaints it anyway, so nothing is booked meanwhile.
+                if ctx.input(|i| i.viewport().minimized == Some(true)) {
+                    std::thread::sleep(DRUM_CHECK * CHANGE_CHECK);
+                    pending = counts::pending();
+                    continue;
+                }
                 std::thread::sleep(DRUM_CHECK);
                 let now = counts::pending();
                 let sides = drum_sides(pending, now, &mut alternate);
                 pending = now;
-                let minimized = ctx.input(|i| i.viewport().minimized == Some(true));
-                if sides != 0 && !minimized {
+                if sides != 0 {
                     SIDES.fetch_or(sides, Ordering::Relaxed);
                     ctx.request_repaint();
                 }
@@ -862,10 +867,15 @@ fn controller_table(ui: &mut egui::Ui, c: Bucket, p: Bucket, before: &str) {
         .num_columns(4)
         .spacing(vec2(16.0, 6.0))
         .show(ui, |ui| {
+            for _ in 0..3 {
+                ui.label("");
+            }
+            weak(ui, before.into());
+            ui.end_row();
             ui.label("Buttons");
             ui.label(RichText::new(group(c.buttons)).color(BRAND_COTTONTAIL));
             ui.label("");
-            weak(ui, format!("{before} {}", group(p.buttons)));
+            weak(ui, group(p.buttons));
             ui.end_row();
             for (name, pulls, ms, prev, prev_ms) in [
                 ("LT", c.lt_pulls, c.lt_ms, p.lt_pulls, p.lt_ms),
