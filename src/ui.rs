@@ -151,7 +151,8 @@ fn spawn_watcher(ctx: egui::Context) {
                 let now = counts::pending();
                 let sides = drum_sides(pending, now, &mut alternate);
                 pending = now;
-                if sides != 0 {
+                let minimized = ctx.input(|i| i.viewport().minimized == Some(true));
+                if sides != 0 && !minimized {
                     SIDES.fetch_or(sides, Ordering::Relaxed);
                     ctx.request_repaint();
                 }
@@ -866,14 +867,14 @@ fn controller_table(ui: &mut egui::Ui, c: Bucket, p: Bucket, before: &str) {
             ui.label("");
             weak(ui, format!("{before} {}", group(p.buttons)));
             ui.end_row();
-            for (name, pulls, ms, prev) in [
-                ("LT", c.lt_pulls, c.lt_ms, p.lt_pulls),
-                ("RT", c.rt_pulls, c.rt_ms, p.rt_pulls),
+            for (name, pulls, ms, prev, prev_ms) in [
+                ("LT", c.lt_pulls, c.lt_ms, p.lt_pulls, p.lt_ms),
+                ("RT", c.rt_pulls, c.rt_ms, p.rt_pulls, p.rt_ms),
             ] {
                 ui.label(name);
                 ui.label(RichText::new(format!("{} pulls", group(pulls))).color(BRAND_COTTONTAIL));
                 ui.label(format!("held {}", duration(ms)));
-                weak(ui, format!("{before} {}", group(prev)));
+                weak(ui, format!("{} · {}", group(prev), duration(prev_ms)));
                 ui.end_row();
             }
         });
