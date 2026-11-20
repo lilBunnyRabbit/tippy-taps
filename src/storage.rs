@@ -9,8 +9,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::clock::{self, Date, Hour, LocalTime, Month};
 use crate::counts::{self, Bucket};
+use crate::keyboard;
 
-const DIR_NAME: &str = "counts";
+pub const DIR_NAME: &str = "counts";
 const VERSION: u32 = 2;
 
 pub type Hours = BTreeMap<Hour, Bucket>;
@@ -214,6 +215,7 @@ pub fn flush(hour: Hour) {
     let Some(storage) = STORAGE.get() else { return };
     let mut storage = storage.lock().unwrap_or_else(|p| p.into_inner());
     storage.flush(hour, counts::take(), &LocalTime::now().stamp());
+    keyboard::flush();
 }
 
 /// Flushes on its own thread, not from egui: a hidden window may stop updating.
@@ -430,6 +432,48 @@ mod tests {
         );
         assert_eq!(saved[&hour(2026, 11, 21, 0)], keys(1, 0));
         assert_eq!(storage.total.keys, 16);
+    }
+
+    #[test]
+    fn per_button_fields_merge_and_round_trip() {
+        let dir = TempDir::new("merge-buttons");
+        std::fs::write(
+            dir.0.join("2026-11.json"),
+            r#"{ "version": 2, "hours": {
+                 "2026-11-20T08": { "clicks": 3, "m_left": 2, "m_x2": 1,
+                                    "buttons": 2, "pad_a": 1, "pad_rs": 1 } } }"#,
+        )
+        .unwrap();
+        let mut storage = Storage::open(dir.0.clone(), "x");
+        let taken = Bucket {
+            clicks: 2,
+            m_left: 1,
+            m_middle: 1,
+            buttons: 1,
+            pad_a: 1,
+            ..Default::default()
+        };
+        storage.flush(hour(2026, 11, 20, 8), taken, "x");
+
+        let text = std::fs::read_to_string(dir.0.join("2026-11.json")).unwrap();
+        assert!(!text.contains("m_right"), "zero fields are omitted");
+        let saved = load_shard(&dir.0.join("2026-11.json"), NOV, "x")
+            .unwrap()
+            .value
+            .unwrap();
+        let expected = Bucket {
+            clicks: 5,
+            m_left: 3,
+            m_middle: 1,
+            m_x2: 1,
+            buttons: 3,
+            pad_a: 2,
+            pad_rs: 1,
+            ..Default::default()
+        };
+        assert_eq!(saved[&hour(2026, 11, 20, 8)], expected);
+        assert_eq!(storage.total, expected);
+        assert_eq!(Storage::open(dir.0.clone(), "x").total, expected);
     }
 
     #[test]

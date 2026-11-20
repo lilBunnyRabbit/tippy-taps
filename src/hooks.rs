@@ -1,17 +1,18 @@
 use std::sync::OnceLock;
-use std::sync::atomic::Ordering;
 
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::{RAWINPUTDEVICE, RIDEV_REMOVE, RegisterRawInputDevices};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetMessageW, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
-    LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, SetWindowsHookExW, TranslateMessage, WH_KEYBOARD_LL,
-    WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEHWHEEL,
-    WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN,
+    CallNextHookEx, DispatchMessageW, GetMessageW, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_EXTENDED,
+    LLKHF_INJECTED, LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, SetWindowsHookExW, TranslateMessage,
+    WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_MBUTTONDOWN,
+    WM_MOUSEHWHEEL, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN,
+    XBUTTON2,
 };
 
-use crate::counts::{self, CLICKS, HeldKeys, KEYS, SCROLLS};
+use crate::counts::{self, Field, HeldKeys};
+use crate::keyboard;
 
 static HELD: HeldKeys = counts::held_keys();
 static ERROR: OnceLock<String> = OnceLock::new();
@@ -69,7 +70,8 @@ unsafe extern "system" fn keyboard(code: i32, wparam: WPARAM, lparam: LPARAM) ->
         match wparam.0 as u32 {
             WM_KEYDOWN | WM_SYSKEYDOWN if !injected => {
                 if counts::press(&HELD, info.vkCode) {
-                    KEYS.fetch_add(1, Ordering::Relaxed);
+                    counts::add(Field::keys, 1);
+                    keyboard::press(info.scanCode, info.flags.0 & LLKHF_EXTENDED.0 != 0);
                 }
             }
             // Releases always clear the held bit, so an injected key-up cannot leave a key stuck.
@@ -78,6 +80,18 @@ unsafe extern "system" fn keyboard(code: i32, wparam: WPARAM, lparam: LPARAM) ->
         }
     }
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
+}
+
+/// The per-button count for a mouse message. `clicks` is derived from these when flushing.
+fn click_field(message: u32, mouse_data: u32) -> Option<Field> {
+    match message {
+        WM_LBUTTONDOWN => Some(Field::m_left),
+        WM_RBUTTONDOWN => Some(Field::m_right),
+        WM_MBUTTONDOWN => Some(Field::m_middle),
+        WM_XBUTTONDOWN if (mouse_data >> 16) as u16 == XBUTTON2 => Some(Field::m_x2),
+        WM_XBUTTONDOWN => Some(Field::m_x1),
+        _ => None,
+    }
 }
 
 unsafe extern "system" fn mouse(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -96,12 +110,27 @@ unsafe extern "system" fn mouse(code: i32, wparam: WPARAM, lparam: LPARAM) -> LR
             if info.flags & LLMHF_INJECTED == 0 {
                 if matches!(message, WM_MOUSEWHEEL | WM_MOUSEHWHEEL) {
                     let delta = (info.mouseData >> 16) as u16 as i16;
-                    SCROLLS.fetch_add(counts::notches(delta), Ordering::Relaxed);
-                } else {
-                    CLICKS.fetch_add(1, Ordering::Relaxed);
+                    counts::add(Field::scrolls, counts::notches(delta));
+                } else if let Some(field) = click_field(message, info.mouseData) {
+                    counts::add(field, 1);
                 }
             }
         }
     }
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clicks_map_to_their_button() {
+        assert_eq!(click_field(WM_LBUTTONDOWN, 0), Some(Field::m_left));
+        assert_eq!(click_field(WM_RBUTTONDOWN, 0), Some(Field::m_right));
+        assert_eq!(click_field(WM_MBUTTONDOWN, 0), Some(Field::m_middle));
+        assert_eq!(click_field(WM_XBUTTONDOWN, 1 << 16), Some(Field::m_x1));
+        assert_eq!(click_field(WM_XBUTTONDOWN, 2 << 16), Some(Field::m_x2));
+        assert_eq!(click_field(WM_MOUSEWHEEL, 120 << 16), None);
+    }
 }

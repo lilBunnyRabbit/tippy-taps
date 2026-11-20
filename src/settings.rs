@@ -6,6 +6,7 @@ use std::sync::{Mutex, OnceLock};
 use serde::{Deserialize, Serialize};
 
 use crate::clock::LocalTime;
+use crate::keyboard::Shape;
 use crate::storage;
 
 const FILE_NAME: &str = "settings.json";
@@ -17,6 +18,10 @@ pub struct Settings {
     pub overlay_pos: Option<[f32; 2]>,
     pub fireworks: bool,
     pub celebrated: BTreeSet<String>,
+    pub key_heatmap: bool,
+    pub key_shape: Option<Shape>,
+    /// The installed layout picked for key labels, as its HKL in hex.
+    pub key_layout: Option<String>,
 }
 
 struct Store {

@@ -12,11 +12,27 @@ use windows::Win32::UI::Input::XboxController::{
     XINPUT_GAMEPAD_TRIGGER_THRESHOLD, XINPUT_STATE, XInputGetState, XUSER_MAX_COUNT,
 };
 
-use crate::counts::{self, Bucket};
+use crate::counts::{self, Bucket, Field};
 
 /// A, B, X, Y, d-pad, bumpers, start, back and stick clicks, in XInput's bit layout. Any other
 /// backend maps its buttons onto these bits.
 pub const BUTTON_MASK: u16 = 0xF3FF;
+const BUTTON_FIELDS: [(u16, Field); 14] = [
+    (0x0001, Field::pad_up),
+    (0x0002, Field::pad_down),
+    (0x0004, Field::pad_left),
+    (0x0008, Field::pad_right),
+    (0x0010, Field::pad_start),
+    (0x0020, Field::pad_back),
+    (0x0040, Field::pad_ls),
+    (0x0080, Field::pad_rs),
+    (0x0100, Field::pad_lb),
+    (0x0200, Field::pad_rb),
+    (0x1000, Field::pad_a),
+    (0x2000, Field::pad_b),
+    (0x4000, Field::pad_x),
+    (0x8000, Field::pad_y),
+];
 pub const TRIGGER_THRESHOLD: f32 = XINPUT_GAMEPAD_TRIGGER_THRESHOLD.0 as f32 / 255.0;
 const SLOTS: usize = XUSER_MAX_COUNT as usize;
 const POLL: Duration = Duration::from_millis(8);
@@ -76,7 +92,15 @@ impl Pad {
         };
         let buttons = s.buttons & BUTTON_MASK;
         if self.connected {
-            out.buttons = u64::from((buttons & !self.buttons).count_ones());
+            let pressed = buttons & !self.buttons;
+            out.buttons = u64::from(pressed.count_ones());
+            let mut fields = out.to_array();
+            for (bit, field) in BUTTON_FIELDS {
+                if pressed & bit != 0 {
+                    fields[field as usize] += 1;
+                }
+            }
+            out = Bucket::from_array(fields);
             self.lt
                 .step(s.lt, elapsed, &mut out.lt_pulls, &mut out.lt_ms);
             self.rt
@@ -229,7 +253,7 @@ pub fn spawn() {
                 }
                 let delta = poller.poll(now, read_xinput);
                 if !delta.is_empty() {
-                    counts::add_controller(delta);
+                    counts::add_bucket(delta);
                 }
                 let wait = poller.wait(Instant::now());
                 match (&timer, poller.any_connected()) {
@@ -264,6 +288,26 @@ mod tests {
         assert_eq!(pad.step(state(A | B | DPAD_UP, 0.0, 0.0), MS).buttons, 2);
         assert_eq!(pad.step(state(0, 0.0, 0.0), MS).buttons, 0, "release");
         assert_eq!(pad.step(state(B, 0.0, 0.0), MS).buttons, 1);
+    }
+
+    #[test]
+    fn each_button_counts_into_its_field() {
+        let mut pad = Pad::default();
+        pad.step(state(0, 0.0, 0.0), MS);
+        let out = pad.step(state(A | B | DPAD_UP | 0x0080 | 0x0200, 0.0, 0.0), MS);
+        assert_eq!(
+            (out.pad_a, out.pad_b, out.pad_up, out.pad_rs, out.pad_rb),
+            (1, 1, 1, 1, 1)
+        );
+        assert_eq!(out.pad_x + out.pad_y + out.pad_lb + out.pad_ls, 0);
+        assert_eq!(out.buttons, 5);
+        pad.step(state(0, 0.0, 0.0), MS);
+        let all = pad.step(state(BUTTON_MASK, 0.0, 0.0), MS);
+        let per_button: u64 = BUTTON_FIELDS
+            .iter()
+            .map(|(_, f)| all.to_array()[*f as usize])
+            .sum();
+        assert_eq!((all.buttons, per_button), (14, 14));
     }
 
     #[test]

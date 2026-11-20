@@ -3,15 +3,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
-pub static KEYS: AtomicU64 = AtomicU64::new(0);
-pub static CLICKS: AtomicU64 = AtomicU64::new(0);
-pub static SCROLLS: AtomicU64 = AtomicU64::new(0);
-static BUTTONS: AtomicU64 = AtomicU64::new(0);
-static LT_PULLS: AtomicU64 = AtomicU64::new(0);
-static RT_PULLS: AtomicU64 = AtomicU64::new(0);
-static LT_MS: AtomicU64 = AtomicU64::new(0);
-static RT_MS: AtomicU64 = AtomicU64::new(0);
-
 const WHEEL_DELTA: u32 = 120;
 /// 3 lines per notch at 16 px per line, 96 DPI.
 const MM_PER_NOTCH: f64 = 12.7;
@@ -20,29 +11,49 @@ fn is_zero(n: &u64) -> bool {
     *n == 0
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Bucket {
-    #[serde(skip_serializing_if = "is_zero")]
-    pub keys: u64,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub clicks: u64,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub scrolls: u64,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub buttons: u64,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub lt_pulls: u64,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub rt_pulls: u64,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub lt_ms: u64,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub rt_ms: u64,
+/// One list of fields drives the struct, its serde form and the pending counters, so a new count
+/// is one line here.
+macro_rules! bucket {
+    ($($field:ident),* $(,)?) => {
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(default)]
+        pub struct Bucket {
+            $(
+                #[serde(skip_serializing_if = "is_zero")]
+                pub $field: u64,
+            )*
+        }
+
+        #[allow(non_camel_case_types, dead_code)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum Field {
+            $($field),*
+        }
+
+        impl Bucket {
+            pub const FIELDS: usize = [$(Field::$field),*].len();
+
+            pub fn to_array(self) -> [u64; Self::FIELDS] {
+                [$(self.$field),*]
+            }
+
+            pub fn from_array([$($field),*]: [u64; Self::FIELDS]) -> Self {
+                Self { $($field),* }
+            }
+        }
+    };
 }
 
+bucket!(
+    keys, clicks, scrolls, buttons, lt_pulls, rt_pulls, lt_ms, rt_ms, //
+    m_left, m_right, m_middle, m_x1, m_x2, //
+    pad_a, pad_b, pad_x, pad_y, pad_up, pad_down, pad_left, pad_right, //
+    pad_lb, pad_rb, pad_start, pad_back, pad_ls, pad_rs,
+);
+
 impl Bucket {
-    /// Every counted input. Engaged trigger time is a duration, not an input, so it stays out.
+    /// Every counted input. Engaged trigger time is a duration, not an input, and the per-button
+    /// fields break down `clicks` and `buttons`, so they stay out.
     pub fn total(&self) -> u64 {
         self.keys + self.clicks + self.scrolls + self.buttons + self.lt_pulls + self.rt_pulls
     }
@@ -54,49 +65,43 @@ impl Bucket {
     pub fn has_controller(&self) -> bool {
         self.buttons + self.lt_pulls + self.rt_pulls + self.lt_ms + self.rt_ms > 0
     }
+
+    pub fn mouse_buttons(&self) -> u64 {
+        self.m_left + self.m_right + self.m_middle + self.m_x1 + self.m_x2
+    }
 }
 
 impl AddAssign for Bucket {
     fn add_assign(&mut self, other: Self) {
-        self.keys += other.keys;
-        self.clicks += other.clicks;
-        self.scrolls += other.scrolls;
-        self.buttons += other.buttons;
-        self.lt_pulls += other.lt_pulls;
-        self.rt_pulls += other.rt_pulls;
-        self.lt_ms += other.lt_ms;
-        self.rt_ms += other.rt_ms;
+        let mut sum = self.to_array();
+        for (a, b) in sum.iter_mut().zip(other.to_array()) {
+            *a += b;
+        }
+        *self = Self::from_array(sum);
     }
 }
 
-const CONTROLLER: [&AtomicU64; 5] = [&BUTTONS, &LT_PULLS, &RT_PULLS, &LT_MS, &RT_MS];
+/// Taps not flushed yet, one counter per `Field`. The hooks add to these and nothing else.
+static PENDING: [AtomicU64; Bucket::FIELDS] = [const { AtomicU64::new(0) }; Bucket::FIELDS];
 
-pub fn add_controller(delta: Bucket) {
-    let values = [
-        delta.buttons,
-        delta.lt_pulls,
-        delta.rt_pulls,
-        delta.lt_ms,
-        delta.rt_ms,
-    ];
-    for (counter, value) in CONTROLLER.into_iter().zip(values) {
+#[inline]
+pub fn add(field: Field, n: u64) {
+    PENDING[field as usize].fetch_add(n, Ordering::Relaxed);
+}
+
+pub fn add_bucket(delta: Bucket) {
+    for (counter, value) in PENDING.iter().zip(delta.to_array()) {
         if value > 0 {
             counter.fetch_add(value, Ordering::Relaxed);
         }
     }
 }
 
+/// The mouse hook adds only the per-button count, so `clicks` is derived here.
 fn read(get: impl Fn(&AtomicU64) -> u64) -> Bucket {
-    Bucket {
-        keys: get(&KEYS),
-        clicks: get(&CLICKS),
-        scrolls: get(&SCROLLS),
-        buttons: get(&BUTTONS),
-        lt_pulls: get(&LT_PULLS),
-        rt_pulls: get(&RT_PULLS),
-        lt_ms: get(&LT_MS),
-        rt_ms: get(&RT_MS),
-    }
+    let mut b = Bucket::from_array(std::array::from_fn(|i| get(&PENDING[i])));
+    b.clicks += b.mouse_buttons();
+    b
 }
 
 pub fn pending() -> Bucket {
@@ -230,12 +235,23 @@ mod tests {
             rt_pulls: 6,
             lt_ms: 700,
             rt_ms: 800,
+            m_left: 1,
+            m_x2: 1,
+            pad_a: 3,
+            pad_rs: 1,
+            ..Default::default()
         };
         a += a;
         assert_eq!(a.keys, 2);
         assert_eq!(a.rt_pulls, 12);
         assert_eq!(a.rt_ms, 1600);
-        assert_eq!(a.total(), 42);
+        assert_eq!((a.m_left, a.m_x2, a.pad_a, a.pad_rs), (2, 2, 6, 2));
+        assert_eq!(a.mouse_buttons(), 4);
+        assert_eq!(
+            a.total(),
+            42,
+            "per-button fields break down clicks and buttons"
+        );
         assert!(a.has_controller());
 
         let keys_only = Bucket {
@@ -258,10 +274,12 @@ mod tests {
         let b = Bucket {
             keys: 5,
             lt_ms: 9,
+            m_x1: 2,
+            pad_back: 1,
             ..Default::default()
         };
         let json = serde_json::to_string(&b).unwrap();
-        assert_eq!(json, r#"{"keys":5,"lt_ms":9}"#);
+        assert_eq!(json, r#"{"keys":5,"lt_ms":9,"m_x1":2,"pad_back":1}"#);
         assert_eq!(serde_json::from_str::<Bucket>(&json).unwrap(), b);
         assert_eq!(
             serde_json::from_str::<Bucket>("{}").unwrap(),
