@@ -462,17 +462,30 @@ impl Store {
             .collect()
     }
 
+    /// Takes every slot's whole array: an add that passed the hook's check just before a
+    /// rewrite can land in a slot or cell the new table no longer has, and is dropped here.
     fn drain(&mut self) {
-        for (slot, id) in self.live.iter().enumerate() {
-            let m = self.monitors.get_mut(id).expect("live monitors are known");
-            let layers = [
-                (&mut m.movement, &MOVES[slot]),
-                (&mut m.clicks, &CLICKS[slot]),
-            ];
-            for (into, pending) in layers {
-                for (n, p) in into.iter_mut().zip(pending.iter()) {
+        for slot in 0..MAX_MONITORS {
+            let mut monitor = self.live.get(slot).and_then(|id| self.monitors.get_mut(id));
+            for layer in 0..2 {
+                let pending = if layer == 0 {
+                    &MOVES[slot]
+                } else {
+                    &CLICKS[slot]
+                };
+                for (i, p) in pending.iter().enumerate() {
                     let taken = p.swap(0, Ordering::Relaxed);
-                    if taken > 0 {
+                    let cell = monitor.as_mut().and_then(|m| {
+                        let cells = if layer == 0 {
+                            &mut m.movement
+                        } else {
+                            &mut m.clicks
+                        };
+                        cells.get_mut(i)
+                    });
+                    if taken > 0
+                        && let Some(n) = cell
+                    {
                         *n += taken;
                         self.dirty = true;
                     }
@@ -481,13 +494,13 @@ impl Store {
         }
     }
 
-    /// Rewrites the hook's table. Pending cells are booked under the old slots first, while the
-    /// odd sequence keeps the hook out.
-    fn publish(&mut self, displays: &[Display]) {
+    /// Rewrites the hook's table after `change`. Pending cells are booked under the old slots
+    /// first, while the odd sequence keeps the hook out.
+    fn rewrite(&mut self, change: impl FnOnce(&mut Self)) {
         SEQ.fetch_add(1, Ordering::Relaxed);
         fence(Ordering::Release);
         self.drain();
-        self.set_displays(displays);
+        change(self);
         let entries = self.entries();
         for (slot, entry) in TABLE.iter().zip(&entries) {
             slot.store(*entry);
@@ -498,19 +511,20 @@ impl Store {
         REVISION.fetch_add(1, Ordering::Relaxed);
     }
 
+    fn publish(&mut self, displays: &[Display]) {
+        self.rewrite(|s| {
+            s.set_displays(displays);
+        });
+    }
+
     fn flush(&mut self, stamp: &str) {
         self.drain();
         if !self.dirty {
             return;
         }
         if !self.loaded {
-            self.try_load(stamp);
-            if self.loaded {
-                let entries = self.entries();
-                if TABLE.iter().zip(&entries).any(|(s, e)| s.load() != *e) {
-                    self.republish();
-                }
-            }
+            // Loading can change a live monitor's grid size, so the hook must not add meanwhile.
+            self.rewrite(|s| s.try_load(stamp));
         }
         if self.loaded {
             let file = File {
@@ -525,23 +539,6 @@ impl Store {
                 Err(err) => self.error = Some(format!("Can't save mouse positions: {err}")),
             }
         }
-    }
-
-    fn republish(&mut self) {
-        let displays: Vec<Display> = self
-            .live
-            .iter()
-            .map(|id| {
-                let m = &self.monitors[id];
-                Display {
-                    id: id.clone(),
-                    name: m.name.clone(),
-                    rect: m.rect,
-                    dpi: m.dpi,
-                }
-            })
-            .collect();
-        self.publish(&displays);
     }
 }
 
