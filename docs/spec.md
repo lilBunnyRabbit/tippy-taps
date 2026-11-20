@@ -82,6 +82,29 @@ Requester asks for: hour/day/week/month counters, time-of-day stats, a gross tot
 - Optional corner overlay rabbit, off by default, toggled from the tray. It is always on top, clicks pass through it, and it is transparent like looking-glass. A "Move rabbit" tray item unlocks it for dragging, and its position persists.
 - The app icon becomes the rabbit.
 
+## Per-button heatmaps (owner, 2026-11-20; task t7, after t4)
+
+Device diagrams tinted by how often each button is pressed. Each is a tab/section in the stats window.
+
+**Keyboard heatmap: opt-in**, off by default.
+- Turning it on shows one line: "Counts presses per key position. Never what you typed, the order, or when."
+- Store one **all-time** total per physical key, keyed by scan code plus the extended bit (512 slots). No per-period breakdown, no timestamps.
+- Hook cost: one atomic increment into a fixed array, which fits the budget. Persist in `keys.json` beside the shards, flushed only when dirty.
+- README privacy line becomes: "Counts only. With the keyboard heatmap turned on, it also counts presses per key position. It never records what you typed, the order, or when."
+- Layout, auto-detected and overridable:
+  - Labels come from the active Windows layout (`GetKeyboardLayout` of the foreground thread, then `MapVirtualKeyExW`/`GetKeyNameTextW`) and follow layout switches.
+  - Board shape (ANSI / ISO / JIS) is guessed from the layout's language: ISO for European languages, JIS for Japanese, ANSI otherwise.
+  - Two dropdowns override it: shape, and labels picked from the installed layouts (`GetKeyboardLayoutList`). Overrides persist in settings.json.
+- Turning it off asks whether to delete the stored per-key counts.
+
+**Mouse buttons** (always on, not sensitive)
+- Per-button counts: left, right, middle, X1, X2. They're stored in the hourly bucket (`m_left`, `m_right`, `m_middle`, `m_x1`, `m_x2`), so they get per-period views.
+- Drawn on a mouse diagram heatmap. The total `clicks` stays.
+
+**Controller buttons** (always on)
+- Per-button counts for every Xbox button (A/B/X/Y, d-pad ×4, LB/RB, LT/RT pulls, start/back, LS/RS click), stored per hourly bucket.
+- Drawn on an original controller diagram (not Microsoft's artwork), with LT/RT engaged time shown on the triggers.
+
 ## Performance budget (owner, 2026-11-20: "tracking should have basically 0 impact on the pc")
 
 Every design choice must meet these:
