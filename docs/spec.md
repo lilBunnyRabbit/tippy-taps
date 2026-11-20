@@ -47,6 +47,40 @@ Stack mirrors `../looking-glass` (read its `src/main.rs`, `Cargo.toml` and `buil
 - Start with Windows checkbox.
 - Footer: "Counts only, never which keys. Stored locally at <path>."
 
+## First-release additions (owner, 2026-11-20)
+
+Requester asks for: hour/day/week/month counters, time-of-day stats, a gross total hidden until clicked, fireworks at milestones, Xbox controller input with trigger engaged time, and a rabbit theme. Nothing has been released yet, so these all ship together as the first release. v0.1 was never published, so the file format can change freely with no migration.
+
+**Storage v2** (replaces the per-day format)
+- `counts.json` = `{ "version": 2, "hours": { "YYYY-MM-DDTHH": Bucket } }`, keyed by local hour. A DST fall-back hour merges into one bucket, which is accepted.
+- `Bucket` = `{ keys, clicks, scrolls, buttons, lt_pulls, rt_pulls, lt_ms, rt_ms }`. Omit zero fields when serialising.
+- Same flush, atomic-write, corrupt-file and locked-file rules as v0.1.
+- `settings.json` sits beside it: overlay on/off and its position, fireworks opt-in, and milestones already celebrated. Autostart stays in the registry only.
+
+**Xbox controller** (XInput through the `windows` crate, enabling feature `Win32_UI_Input_XboxController`; no new dependency)
+- Poll thread at about 125 Hz for connected slots. Probe disconnected slots only every 2 s, because XInputGetState on an empty slot is slow.
+- `buttons`: an up-to-down transition on any digital button (A/B/X/Y, d-pad, bumpers, start/back, stick clicks).
+- Triggers: a press is counted when the value crosses `XINPUT_GAMEPAD_TRIGGER_THRESHOLD` (30) upward. `lt_ms`/`rt_ms` = time spent above the threshold, accumulated per poll from real elapsed time.
+- Sticks are not counted.
+
+**Stats window**
+- Period tabs: Hour (this hour), Day, Week (Monday start), Month, each with the counts for that period and the one before it.
+- Time of day: a weekday x hour heatmap (7x24) of the total inputs.
+- Year calendar heatmap: one cell per day, GitHub-style, for the last 53 weeks.
+- Hovering or clicking a heatmap cell shows that cell's breakdown.
+- Controller section (shown once any controller data exists): buttons, LT/RT pulls, LT/RT engaged time.
+- Gross total: all-time sum of every count, hidden behind a "tap to reveal" control and hidden again on close.
+
+**Milestones + fireworks** (opt-in, off by default, toggled in the window and the tray menu)
+- Thresholds per count and for the gross total: 1k, 10k, 50k, 100k, 250k, 500k, 1M, then every 1M. Each fires once; the celebrated set is kept in settings.json.
+- Fireworks play in the window and on the overlay rabbit, wherever they are visible. When neither is visible, queue them for the next time the window opens. A tray balloon/notification is allowed only if no new dependency is needed for it.
+
+**Rabbit theme** (art from the designer, task t3)
+- An original rabbit character. It must not copy Bongo Cat's look or layout.
+- The window header has the rabbit drumming its paws on input.
+- Optional corner overlay rabbit, off by default, toggled from the tray. It is always on top, clicks pass through it, and it is transparent like looking-glass. A "Move rabbit" tray item unlocks it for dragging, and its position persists.
+- The app icon becomes the rabbit.
+
 ## Done when
 
 - `cargo build --release --locked` and `cargo clippy -- -D warnings` pass.
