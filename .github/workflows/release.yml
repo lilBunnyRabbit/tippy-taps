@@ -1,0 +1,22 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - run: Copy-Item target/release/tippy-taps.exe "tippy-taps-${{ github.ref_name }}-windows-x64.exe"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: tippy-taps-*.exe
+          generate_release_notes: true
