@@ -181,7 +181,7 @@ impl Paws {
 fn key_side(scan: u32, extended: bool) -> u8 {
     match (scan, extended) {
         (0x39, false) => BOTH,
-        (0x01..=0x07 | 0x0f..=0x14 | 0x1d | 0x1e..=0x22 | 0x29..=0x30 | 0x38, false) => LEFT,
+        (0x01..=0x07 | 0x0f..=0x14 | 0x1d..=0x22 | 0x29 | 0x2a | 0x2c..=0x30 | 0x38, false) => LEFT,
         (0x3a..=0x40 | 0x56, false) => LEFT,
         (0x5b, true) => LEFT,
         _ => RIGHT,
@@ -421,7 +421,6 @@ impl Overlay {
         let image = self.shown.unwrap_or(Image::Frame(Frame::Idle));
         self.draw(image, Some(pos));
         if !VISIBLE.swap(true, Ordering::Relaxed) {
-            self.hook();
             unsafe {
                 let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
             }
@@ -430,11 +429,6 @@ impl Overlay {
     }
 
     fn hide(&mut self) {
-        for hook in self.hooks.drain(..) {
-            unsafe {
-                let _ = UnhookWindowsHookEx(hook);
-            }
-        }
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_HIDE);
         }
@@ -444,6 +438,14 @@ impl Overlay {
         self.paws = Paws::default();
         SIDES.store(0, Ordering::Relaxed);
         VISIBLE.store(false, Ordering::Relaxed);
+    }
+
+    fn unhook(&mut self) {
+        for hook in self.hooks.drain(..) {
+            unsafe {
+                let _ = UnhookWindowsHookEx(hook);
+            }
+        }
     }
 
     fn hook(&mut self) {
@@ -523,14 +525,24 @@ impl Overlay {
 
     /// How long the thread may sleep; None = until the next message.
     fn tick(&mut self, now: u64) -> Option<u64> {
-        if SYNC.swap(false, Ordering::Acquire) {
-            self.sync();
+        let resync = SYNC.swap(false, Ordering::Acquire);
+        let moved = MOVED.swap(false, Ordering::Relaxed);
+        if resync || moved {
+            // Settings I/O, its lock and art rebuilds can block; hooks this thread serves
+            // would stall all input meanwhile, and Windows drops hooks that time out.
+            self.unhook();
+            if resync {
+                self.sync();
+            }
+            if moved && self.visible() {
+                self.moved();
+            }
+            if self.visible() {
+                self.hook();
+            }
         }
         if !self.visible() {
             return None;
-        }
-        if MOVED.swap(false, Ordering::Relaxed) {
-            self.moved();
         }
         if CHEER.swap(false, Ordering::Acquire) {
             self.paws.cheer(now);
@@ -671,7 +683,7 @@ mod tests {
             assert_eq!(key_side(scan, false), LEFT, "scan {scan:#x}");
         }
         assert_eq!(key_side(0x5b, true), LEFT, "left Windows key");
-        for scan in [0x15, 0x23, 0x31, 0x1c, 0x36, 0x0e, 0x44] {
+        for scan in [0x15, 0x23, 0x31, 0x1c, 0x36, 0x0e, 0x44, 0x2b] {
             assert_eq!(key_side(scan, false), RIGHT, "scan {scan:#x}");
         }
         assert_eq!(key_side(0x1d, true), RIGHT, "right Ctrl");

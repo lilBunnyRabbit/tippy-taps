@@ -79,6 +79,13 @@ pub fn take_queued() -> Vec<Milestone> {
     std::mem::take(&mut *QUEUE.lock().unwrap_or_else(|p| p.into_inner()))
 }
 
+pub fn requeue(shows: Vec<Milestone>) {
+    let mut queue = QUEUE.lock().unwrap_or_else(|p| p.into_inner());
+    queue.splice(0..0, shows);
+    let excess = queue.len().saturating_sub(QUEUE_MAX);
+    queue.drain(..excess);
+}
+
 /// Records newly reached milestones and queues fireworks for them when they are on. The first
 /// check of a session only records: anything reached then was crossed before we were watching
 /// (or while settings.json was missing). Returns true when fireworks were queued.
@@ -117,6 +124,20 @@ pub fn check_storage(pending: Bucket) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn requeued_shows_go_first_and_the_queue_stays_capped() {
+        let show = |value| Milestone {
+            count: "keys",
+            value,
+        };
+        QUEUE.lock().unwrap().extend((1..=QUEUE_MAX as u64).map(|n| show(n * 10)));
+        requeue(vec![show(1), show(2)]);
+        let queue = take_queued();
+        assert_eq!(queue.len(), QUEUE_MAX);
+        assert_eq!(queue[0], show(10), "the oldest are dropped first");
+        assert_eq!(queue.last(), Some(&show(QUEUE_MAX as u64 * 10)));
+    }
 
     #[test]
     fn thresholds() {
