@@ -66,7 +66,9 @@ pub struct Storage {
     /// that arrives later skips them, so nothing is counted twice.
     read: BTreeSet<Date>,
     history: History,
-    unsplit: bool,
+    /// v0.1 months whose split failed. Their days are held like unreadable files: counts stay in
+    /// memory, no day of the month is read or written, and every flush retries the split.
+    unsplit: BTreeSet<Month>,
 }
 
 impl Storage {
@@ -81,27 +83,44 @@ impl Storage {
             blocked: BTreeSet::new(),
             read: BTreeSet::new(),
             history: History::Loading,
-            unsplit: false,
+            unsplit: BTreeSet::new(),
         };
         storage.upgrade(stamp);
-        storage.load_day(today, stamp);
+        if !storage.held(today) {
+            storage.load_day(today, stamp);
+        }
         storage
     }
 
     #[cfg(test)]
     pub fn open(dir: PathBuf, today: Date, stamp: &str) -> Self {
         let mut storage = Self::open_today(dir, today, stamp);
-        let history = read_history(&storage.dir, &storage.read, stamp);
+        let history = read_history(&storage.dir, &storage.skip(), stamp);
         storage.merge_history(history);
         storage
     }
 
     pub fn saving_blocked(&self) -> bool {
-        !self.blocked.is_empty()
+        !self.clear()
     }
 
     pub fn complete(&self) -> bool {
-        self.history == History::Loaded && self.blocked.is_empty() && !self.unsplit
+        self.history == History::Loaded && self.clear()
+    }
+
+    fn clear(&self) -> bool {
+        self.blocked.is_empty() && self.unsplit.is_empty()
+    }
+
+    fn held(&self, date: Date) -> bool {
+        self.unsplit.contains(&date.month())
+    }
+
+    fn skip(&self) -> Skip {
+        Skip {
+            days: self.read.clone(),
+            months: self.unsplit.clone(),
+        }
     }
 
     pub fn day(&self, date: Date) -> Bucket {
@@ -117,11 +136,11 @@ impl Storage {
             Ok(days) => {
                 self.history = History::Loaded;
                 for (date, result) in days {
-                    if !self.read.contains(&date) {
+                    if !self.read.contains(&date) && !self.held(date) {
                         self.apply_day(date, result);
                     }
                 }
-                if self.blocked.is_empty() && !self.unsplit {
+                if self.clear() {
                     self.error = None;
                 }
             }
@@ -144,8 +163,11 @@ impl Storage {
             REVISION.fetch_add(1, Ordering::Relaxed);
         }
         if self.history == History::Unlisted {
-            let history = read_history(&self.dir, &self.read, stamp);
+            let history = read_history(&self.dir, &self.skip(), stamp);
             self.merge_history(history);
+        }
+        for month in self.unsplit.clone() {
+            self.split(month, stamp);
         }
         for date in self.blocked.clone() {
             self.load_day(date, stamp);
@@ -155,6 +177,9 @@ impl Storage {
         }
         let mut failed = None;
         for date in self.dirty.clone() {
+            if self.held(date) {
+                continue;
+            }
             if !self.read.contains(&date) && !self.blocked.contains(&date) {
                 self.load_day(date, stamp);
             }
@@ -168,7 +193,7 @@ impl Storage {
                 Err(err) => failed = Some(format!("Can't save counts: {err}")),
             }
         }
-        if failed.is_some() || (self.blocked.is_empty() && !self.unsplit) {
+        if failed.is_some() || self.clear() {
             self.error = failed;
         }
     }
@@ -199,7 +224,7 @@ impl Storage {
                         self.dirty.insert(date);
                     }
                 }
-                if self.blocked.is_empty() && !self.unsplit {
+                if self.clear() {
                     self.error = None;
                 }
                 REVISION.fetch_add(1, Ordering::Relaxed);
@@ -229,21 +254,36 @@ impl Storage {
             })
             .collect();
         for month in months {
-            match split_month(&self.dir, month, stamp) {
-                Ok(moved) => {
-                    for p in moved {
-                        let name = p.file_name().unwrap_or_default().to_string_lossy();
-                        self.notice =
-                            Some(format!("A file was unreadable and was moved to {name}"));
+            self.split(month, stamp);
+        }
+    }
+
+    /// A month split on a retry may hold days that are already in `hours` as unsaved counts;
+    /// its files are read on top of them, like any day read late.
+    fn split(&mut self, month: Month, stamp: &str) {
+        match split_month(&self.dir, month, stamp) {
+            Ok(moved) => {
+                for p in moved {
+                    let name = p.file_name().unwrap_or_default().to_string_lossy();
+                    self.notice = Some(format!("A file was unreadable and was moved to {name}"));
+                }
+                if self.unsplit.remove(&month) {
+                    for date in list_days(&self.dir).unwrap_or_default() {
+                        if date.month() == month && !self.read.contains(&date) {
+                            self.load_day(date, stamp);
+                        }
+                    }
+                    if self.clear() {
+                        self.error = None;
                     }
                 }
-                Err(err) => {
-                    self.unsplit = true;
-                    self.error = Some(format!(
-                        "Can't upgrade {month}.json to day files: {err}. Its counts are left \
-                         out until the next start."
-                    ));
-                }
+            }
+            Err(err) => {
+                self.unsplit.insert(month);
+                self.error = Some(format!(
+                    "Can't upgrade {month}.json to day files: {err}. Counting in memory and \
+                     retrying every 30 s."
+                ));
             }
         }
     }
@@ -267,10 +307,15 @@ fn dates(hours: &Hours) -> BTreeSet<Date> {
     hours.keys().map(|h| h.date).collect()
 }
 
-pub fn read_history(dir: &Path, skip: &BTreeSet<Date>, stamp: &str) -> HistoryRead {
+pub struct Skip {
+    days: BTreeSet<Date>,
+    months: BTreeSet<Month>,
+}
+
+pub fn read_history(dir: &Path, skip: &Skip, stamp: &str) -> HistoryRead {
     HistoryRead(list_days(dir).map(|days| {
         days.into_iter()
-            .filter(|d| !skip.contains(d))
+            .filter(|d| !skip.days.contains(d) && !skip.months.contains(&d.month()))
             .map(|d| (d, read_day(dir, d, stamp)))
             .collect()
     }))
@@ -278,7 +323,11 @@ pub fn read_history(dir: &Path, skip: &BTreeSet<Date>, stamp: &str) -> HistoryRe
 
 fn list_days(dir: &Path) -> io::Result<Vec<Date>> {
     let mut days = Vec::new();
-    for year in std::fs::read_dir(dir)? {
+    let years = match std::fs::read_dir(dir) {
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(days),
+        years => years?,
+    };
+    for year in years {
         let year = year?;
         let name = year.file_name();
         let Some(y) = name
@@ -375,7 +424,7 @@ pub fn data_dir() -> PathBuf {
 pub fn init(dir: &Path) {
     let now = LocalTime::now();
     let storage = Storage::open_today(dir.join(DIR_NAME), now.date, &now.stamp());
-    let (dir, skip) = (storage.dir.clone(), storage.read.clone());
+    let (dir, skip) = (storage.dir.clone(), storage.skip());
     let _ = STORAGE.set(Mutex::new(storage));
     std::thread::Builder::new()
         .name("history".into())
@@ -626,10 +675,8 @@ mod tests {
         let storage = Storage::open(dir.0.join(DIR_NAME), TODAY, "x");
         assert!(storage.hours.is_empty());
         assert!(!storage.saving_blocked());
-        assert!(
-            !storage.complete(),
-            "an unlisted dir is not complete history"
-        );
+        assert!(storage.complete());
+        assert!(storage.error.is_none(), "a first run shows no error");
     }
 
     #[test]
@@ -899,7 +946,7 @@ mod tests {
         let mut storage = Storage::open_today(dir.0.clone(), TODAY, "x");
         assert_eq!(storage.total, keys(7, 0), "today is there before history");
         assert!(!storage.complete(), "milestones wait for history");
-        let (path, skip) = (storage.dir.clone(), storage.read.clone());
+        let (path, skip) = (storage.dir.clone(), storage.skip());
         let history = std::thread::spawn(move || read_history(&path, &skip, "x"))
             .join()
             .unwrap();
@@ -919,7 +966,7 @@ mod tests {
             r#"{"version":2,"hours":{"2026-11-21T01":{"keys":2}}}"#,
         );
         let mut storage = Storage::open_today(dir.0.clone(), TODAY, "x");
-        let history = read_history(&storage.dir, &storage.read, "x");
+        let history = read_history(&storage.dir, &storage.skip(), "x");
         storage.flush(hour(2026, 11, 20, 23), keys(1, 0), "x");
         storage.flush(hour(2026, 11, 21, 0), keys(1, 0), "x");
         storage.merge_history(history);
@@ -1026,15 +1073,64 @@ mod tests {
     }
 
     #[test]
-    fn locked_month_shard_waits_for_the_next_start() {
+    fn locked_month_shard_holds_its_days_and_retries() {
         let dir = TempDir::new("split-locked");
-        std::fs::create_dir(dir.0.join("2026-11.json")).unwrap();
+        let shard = dir.0.join("2026-11.json");
+        std::fs::create_dir(&shard).unwrap();
         let mut storage = open(&dir);
         assert!(!storage.complete());
-        assert!(!storage.saving_blocked(), "today still saves");
+        assert!(storage.saving_blocked());
         storage.flush(hour(2026, 11, 20, 9), keys(2, 0), "x");
+        storage.flush(hour(2026, 10, 31, 9), keys(1, 0), "x");
+        assert!(!dir.day(11, 20).exists(), "no day of the month is written");
+        assert!(dir.day(10, 31).exists(), "other months still save");
+        assert!(storage.error.is_some());
+
+        std::fs::remove_dir(&shard).unwrap();
+        std::fs::write(&shard, NOV_SHARD).unwrap();
+        storage.flush(hour(2026, 11, 20, 9), Bucket::default(), "x");
+        assert!(storage.complete());
+        assert!(storage.error.is_none());
+        assert_eq!(storage.total.keys, 3 + 5 + 2 + 2 + 1);
+        assert_eq!(saved(&dir.day(11, 20))[&hour(2026, 11, 20, 8)], keys(2, 0));
         assert_eq!(saved(&dir.day(11, 20))[&hour(2026, 11, 20, 9)], keys(2, 0));
-        assert!(storage.error.is_some(), "the missing month stays reported");
+        assert_eq!(open(&dir).total, storage.total);
+    }
+
+    #[test]
+    fn counts_during_a_failed_split_survive_the_resume() {
+        let dir = TempDir::new("split-session");
+        std::fs::write(dir.0.join("2026-11.json"), NOV_SHARD).unwrap();
+        let blocker = dir.0.join("2026/11-15.json.tmp");
+        std::fs::create_dir_all(&blocker).unwrap();
+        let mut storage = open(&dir);
+        storage.flush(hour(2026, 11, 20, 9), keys(100, 0), "x");
+        assert_eq!(storage.total.keys, 100);
+        drop(storage);
+
+        std::fs::remove_dir(&blocker).unwrap();
+        let mut storage = open(&dir);
+        assert_eq!(
+            storage.total.keys,
+            3 + 5 + 2,
+            "the unsaved session was lost, not doubled"
+        );
+        storage.flush(hour(2026, 11, 20, 9), keys(100, 0), "x");
+        assert_eq!(open(&dir).total.keys, 3 + 5 + 2 + 100);
+
+        std::fs::write(
+            dir.0.join("2026-12.json"),
+            NOV_SHARD.replace("-11-", "-12-"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.0.join("2026/12-15.json.tmp")).unwrap();
+        let mut storage = Storage::open(dir.0.clone(), date(2026, 12, 20), "x");
+        storage.flush(hour(2026, 12, 20, 9), keys(50, 0), "x");
+        std::fs::remove_dir(dir.0.join("2026/12-15.json.tmp")).unwrap();
+        storage.flush(hour(2026, 12, 20, 9), Bucket::default(), "x");
+        let reopened = Storage::open(dir.0.clone(), date(2026, 12, 20), "x");
+        assert_eq!(reopened.total.keys, 2 * (3 + 5 + 2) + 100 + 50);
+        assert_eq!(reopened.total, storage.total);
     }
 
     #[test]
