@@ -1,14 +1,20 @@
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::Thread;
 use std::time::Duration;
 
 use eframe::egui::{
-    self, Align2, Color32, CornerRadius, FontId, Rect, RichText, Sense, Stroke, Vec2,
-    ViewportCommand, pos2,
+    self, Align2, Color32, CornerRadius, FontId, Id, LayerId, Order, Rect, RichText, Sense, Stroke,
+    Vec2, ViewportCommand, pos2, vec2,
 };
 
-use crate::clock::{self, Date};
-use crate::counts::{self, Counts, group};
-use crate::{autostart, hooks, storage, tray};
+use windows::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};
+
+use crate::clock::{self, Date, Hour};
+use crate::counts::{self, Bucket, duration, group, scroll_distance};
+use crate::fireworks::Fireworks;
+use crate::stats::{self, CALENDAR_WEEKS, Period, Stats};
+use crate::{autostart, hooks, milestones, settings, storage, tray};
 
 const BRAND_DARKER: Color32 = Color32::from_rgb(0x0b, 0x15, 0x19);
 const BRAND_BG: Color32 = Color32::from_rgb(0x17, 0x25, 0x2c);
@@ -21,19 +27,23 @@ const BRAND_PRIMARY_TINT: Color32 = Color32::from_rgb(0x2a, 0x37, 0x31);
 const BRAND_COTTONTAIL: Color32 = Color32::from_rgb(0xe3, 0xf9, 0xb2);
 const BRAND_WARNING: Color32 = Color32::from_rgb(0xe4, 0x9b, 0x39);
 const BRAND_ERROR: Color32 = Color32::from_rgb(0xf8, 0x88, 0x76);
-const HISTORY_DAYS: i64 = 30;
-const REPAINT: Duration = Duration::from_millis(500);
-const DATE_WIDTH: f32 = 84.0;
-const TOTAL_WIDTH: f32 = 72.0;
-const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const CHANGE_CHECK: Duration = Duration::from_millis(500);
+const LABEL_WIDTH: f32 = 30.0;
+const LABEL_HEIGHT: f32 = 14.0;
+const GAP: f32 = 2.0;
+const WEEKDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
 
 static SHOWN: AtomicBool = AtomicBool::new(false);
+static WATCHER: OnceLock<Thread> = OnceLock::new();
 
 pub fn show(ctx: &egui::Context) {
     SHOWN.store(true, Ordering::Relaxed);
+    if let Some(thread) = WATCHER.get() {
+        thread.unpark();
+    }
     ctx.send_viewport_cmd(ViewportCommand::Visible(true));
     ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
     ctx.send_viewport_cmd(ViewportCommand::Focus);
@@ -45,55 +55,93 @@ fn hide(ctx: &egui::Context) {
     ctx.send_viewport_cmd(ViewportCommand::Visible(false));
 }
 
-struct Snapshot {
-    today: Counts,
-    total: Counts,
-    history: Vec<(Date, Counts)>,
-    path: String,
-    error: Option<String>,
-    notice: Option<String>,
+pub fn shown() -> bool {
+    SHOWN.load(Ordering::Relaxed)
 }
 
-impl Snapshot {
-    fn take() -> Self {
-        let today = clock::today();
-        let storage = storage::get();
-        let pending = counts::pending();
-        let mut today_counts = storage.day(today);
-        today_counts += pending;
-        let mut total = storage.total();
-        total += pending;
-        let history = (0..HISTORY_DAYS)
-            .map(|back| {
-                let date = today.minus_days(back);
-                let c = if back == 0 {
-                    today_counts
-                } else {
-                    storage.day(date)
-                };
-                (date, c)
-            })
-            .collect();
-        Self {
-            today: today_counts,
-            total,
-            history,
-            path: storage.path.display().to_string(),
-            error: storage.error.clone(),
-            notice: storage.notice.clone(),
-        }
+type Fingerprint = (u64, Hour, Bucket);
+
+fn fingerprint() -> Fingerprint {
+    (storage::revision(), clock::now_hour(), counts::pending())
+}
+
+/// Wakes egui only when something on screen changed, and parks while the window is hidden, so
+/// an open window costs nothing between taps and a hidden one costs nothing at all.
+fn spawn_watcher(ctx: egui::Context) {
+    let handle = std::thread::Builder::new()
+        .name("repaint".into())
+        .spawn(move || {
+            let mut last = fingerprint();
+            let mut trimmed = false;
+            loop {
+                if !shown() {
+                    if !trimmed {
+                        trim_working_set();
+                        trimmed = true;
+                    }
+                    std::thread::park();
+                    continue;
+                }
+                trimmed = false;
+                std::thread::sleep(CHANGE_CHECK);
+                let now = fingerprint();
+                if now != last {
+                    last = now;
+                    ctx.request_repaint();
+                }
+            }
+        })
+        .expect("spawn repaint thread");
+    let _ = WATCHER.set(handle.thread().clone());
+}
+
+/// eframe cannot destroy its root window, so a hidden window keeps its GL context and buffers.
+/// Handing those pages back to Windows on hide keeps the tray-only footprint small; they page
+/// back in when the window opens again. Runs here, after the hide has been applied.
+fn trim_working_set() {
+    unsafe {
+        let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
     }
 }
 
-pub struct App;
+pub struct App {
+    period: Period,
+    revealed: bool,
+    stats: Option<(Fingerprint, Stats)>,
+    pinned_hour: Option<(usize, usize)>,
+    pinned_day: Option<(usize, usize)>,
+    fireworks: Fireworks,
+}
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         apply_theme(&cc.egui_ctx);
         hooks::drop_raw_input();
         SHOWN.store(true, Ordering::Relaxed);
+        spawn_watcher(cc.egui_ctx.clone());
         tray::attach(cc.egui_ctx.clone());
-        Self
+        let seed = clock::LocalTime::now().ms_of_day as u64 ^ 0x9e37_79b9_7f4a_7c15;
+        Self {
+            period: Period::Day,
+            revealed: false,
+            stats: None,
+            pinned_hour: None,
+            pinned_day: None,
+            fireworks: Fireworks::new(
+                [BRAND_COTTONTAIL, BRAND_PRIMARY, BRAND_WARNING, BRAND_ERROR],
+                seed,
+            ),
+        }
+    }
+
+    fn stats(&mut self) -> &Stats {
+        let key = fingerprint();
+        if self.stats.as_ref().is_none_or(|(k, _)| *k != key) {
+            let storage = storage::get();
+            let stats = stats::compute(&storage.hours, storage.total, key.2, key.1);
+            self.stats = Some((key, stats));
+        }
+        &self.stats.as_ref().expect("just set").1
     }
 }
 
@@ -105,82 +153,194 @@ impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+            self.revealed = false;
             hide(ctx);
         }
-        if SHOWN.load(Ordering::Relaxed) {
-            ctx.request_repaint_after(REPAINT);
+        if shown() {
+            for m in milestones::take_queued() {
+                self.fireworks.launch(m.label());
+            }
+        }
+        if self.fireworks.active() {
+            let area = ctx.content_rect();
+            self.fireworks.step(ctx.input(|i| i.stable_dt), area);
+            let painter =
+                ctx.layer_painter(LayerId::new(Order::Foreground, Id::unique("fireworks")));
+            self.fireworks.paint(&painter, area, BRAND_DARKER);
+            ctx.request_repaint();
         }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let snap = Snapshot::take();
-        egui::Frame::new().inner_margin(16).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.label(
-                RichText::new("Tippy Taps")
-                    .size(20.0)
-                    .color(BRAND_COTTONTAIL)
-                    .strong(),
-            );
-            ui.add_space(12.0);
-
-            caption(ui, "TODAY");
-            ui.columns(3, |cols| {
-                stat(&mut cols[0], snap.today.keys, "keys");
-                stat(&mut cols[1], snap.today.clicks, "clicks");
-                stat(&mut cols[2], snap.today.scrolls, "scrolls");
-            });
-            ui.add_space(12.0);
-
-            caption(ui, "ALL TIME");
-            ui.label(breakdown(snap.total));
-            ui.add_space(12.0);
-
-            caption(ui, "LAST 30 DAYS");
-            let max = snap
-                .history
-                .iter()
-                .map(|(_, c)| c.total())
-                .max()
-                .unwrap_or(0);
-            ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                ui.label(
-                    RichText::new(format!(
-                        "Counts only, never which keys. Stored locally at {}.",
-                        snap.path
-                    ))
-                    .small()
-                    .color(BRAND_FG_WEAK),
-                );
-                for text in [&snap.notice, &snap.error].into_iter().flatten() {
-                    ui.colored_label(BRAND_WARNING, text);
-                }
-                if let Some(err) = hooks::error() {
-                    ui.colored_label(BRAND_ERROR, err);
-                }
-                let mut on = autostart::enabled();
-                if ui.checkbox(&mut on, "Start with Windows").changed() {
-                    let _ = autostart::set(on);
-                    tray::sync_autostart();
-                }
-                ui.add_space(4.0);
-                ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            for (date, c) in &snap.history {
-                                day_row(ui, *date, *c, max);
-                            }
-                        });
+        let stats = self.stats().clone();
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                egui::Frame::new().inner_margin(16).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    self.content(ui, &stats);
                 });
             });
+    }
+}
+
+impl App {
+    fn content(&mut self, ui: &mut egui::Ui, stats: &Stats) {
+        ui.label(
+            RichText::new("Tippy Taps")
+                .size(20.0)
+                .color(BRAND_COTTONTAIL)
+                .strong(),
+        );
+        ui.add_space(10.0);
+
+        ui.horizontal(|ui| {
+            for p in Period::ALL {
+                ui.selectable_value(&mut self.period, p, p.label());
+            }
         });
+        ui.add_space(8.0);
+        let (current, previous) = stats.period(self.period);
+        caption(ui, self.period.current_label());
+        ui.columns(3, |cols| {
+            stat(&mut cols[0], current.keys, "keys");
+            stat(&mut cols[1], current.clicks, "clicks");
+            stat(&mut cols[2], current.scrolls, "scrolls");
+        });
+        ui.add_space(4.0);
+        weak(ui, format!("{} scrolled", scroll_distance(current.scrolls)));
+        weak(
+            ui,
+            format!("{}: {}", self.period.previous_label(), breakdown(previous)),
+        );
+        ui.add_space(12.0);
+
+        if stats.total.has_controller() {
+            caption(ui, "CONTROLLER");
+            controller(ui, current);
+            ui.add_space(12.0);
+        }
+
+        caption(ui, "ALL TIME");
+        ui.label(breakdown(stats.total));
+        weak(
+            ui,
+            format!("{} scrolled", scroll_distance(stats.total.scrolls)),
+        );
+        ui.horizontal(|ui| {
+            ui.label("Gross total:");
+            if self.revealed {
+                ui.label(
+                    RichText::new(group(stats.total.total()))
+                        .color(BRAND_COTTONTAIL)
+                        .strong(),
+                );
+            } else if ui.button("tap to reveal").clicked() {
+                self.revealed = true;
+            }
+        });
+        ui.add_space(12.0);
+
+        caption(ui, "TIME OF DAY");
+        let cell = |(col, row): (usize, usize)| stats.time_of_day[row][col];
+        let max = stats.time_of_day.iter().flatten().map(Bucket::total).max();
+        let hour_labels = [(0, "0"), (6, "6"), (12, "12"), (18, "18")]
+            .map(|(c, t)| (c, t.to_string()))
+            .to_vec();
+        let hovered = heatmap(
+            ui,
+            (24, 7),
+            &hour_labels,
+            &|_| true,
+            &|pos| cell(pos).total(),
+            max.unwrap_or(0),
+            &mut self.pinned_hour,
+        );
+        detail(
+            ui,
+            hovered.or(self.pinned_hour).map(|(h, d)| {
+                format!(
+                    "{} {h:02}:00–{:02}:00 · {}",
+                    WEEKDAYS[d],
+                    h + 1,
+                    totals(cell((h, d)))
+                )
+            }),
+        );
+        ui.add_space(12.0);
+
+        caption(ui, "LAST 53 WEEKS");
+        let today = (stats.now.date.to_days() - stats.calendar_start.to_days()) as usize;
+        let day = |(week, weekday): (usize, usize)| week * 7 + weekday;
+        let max = stats.days.iter().map(Bucket::total).max().unwrap_or(0);
+        let hovered = heatmap(
+            ui,
+            (CALENDAR_WEEKS, 7),
+            &month_labels(stats.calendar_start),
+            &|pos| day(pos) <= today,
+            &|pos| stats.days[day(pos)].total(),
+            max,
+            &mut self.pinned_day,
+        );
+        detail(
+            ui,
+            hovered.or(self.pinned_day).map(|pos| {
+                let date = stats.calendar_start.plus_days(day(pos) as i64);
+                format!("{} · {}", day_label(date), totals(stats.days[day(pos)]))
+            }),
+        );
+        ui.add_space(12.0);
+
+        let mut on = autostart::enabled();
+        if ui.checkbox(&mut on, "Start with Windows").changed() {
+            let _ = autostart::set(on);
+            tray::sync_menu();
+        }
+        let mut fireworks = settings::fireworks();
+        if ui
+            .checkbox(&mut fireworks, "Fireworks at milestones")
+            .changed()
+        {
+            settings::update(|s| s.fireworks = fireworks);
+            tray::sync_menu();
+        }
+        ui.add_space(8.0);
+
+        let (dir, notice, error) = {
+            let storage = storage::get();
+            (
+                storage.dir.display().to_string(),
+                storage.notice.clone(),
+                storage.error.clone(),
+            )
+        };
+        for text in [notice, error, settings::error()].into_iter().flatten() {
+            ui.colored_label(BRAND_WARNING, text);
+        }
+        if let Some(err) = hooks::error() {
+            ui.colored_label(BRAND_ERROR, err);
+        }
+        weak(
+            ui,
+            format!("Counts only, never which keys. Stored locally at {dir}."),
+        );
     }
 }
 
 fn caption(ui: &mut egui::Ui, text: &str) {
     ui.label(RichText::new(text).small().strong().color(BRAND_FG_WEAK));
     ui.add_space(2.0);
+}
+
+fn weak(ui: &mut egui::Ui, text: String) {
+    ui.label(RichText::new(text).small().color(BRAND_FG_WEAK));
+}
+
+fn detail(ui: &mut egui::Ui, text: Option<String>) {
+    weak(
+        ui,
+        text.unwrap_or_else(|| "Hover or click a cell for its counts".into()),
+    );
 }
 
 fn stat(ui: &mut egui::Ui, value: u64, label: &str) {
@@ -204,57 +364,161 @@ fn stat(ui: &mut egui::Ui, value: u64, label: &str) {
         });
 }
 
-fn breakdown(c: Counts) -> String {
-    format!(
+fn controller(ui: &mut egui::Ui, c: Bucket) {
+    egui::Grid::new("controller")
+        .num_columns(3)
+        .spacing(vec2(16.0, 4.0))
+        .show(ui, |ui| {
+            ui.label("Buttons");
+            ui.label(RichText::new(group(c.buttons)).color(BRAND_COTTONTAIL));
+            ui.label("");
+            ui.end_row();
+            for (name, pulls, ms) in [("LT", c.lt_pulls, c.lt_ms), ("RT", c.rt_pulls, c.rt_ms)] {
+                ui.label(name);
+                ui.label(RichText::new(format!("{} pulls", group(pulls))).color(BRAND_COTTONTAIL));
+                ui.label(format!("held {}", duration(ms)));
+                ui.end_row();
+            }
+        });
+}
+
+fn breakdown(c: Bucket) -> String {
+    let mut text = format!(
         "{} keys · {} clicks · {} scrolls",
         group(c.keys),
         group(c.clicks),
         group(c.scrolls)
-    )
+    );
+    if c.has_controller() {
+        text.push_str(&format!(
+            " · {} buttons · LT {} · RT {}",
+            group(c.buttons),
+            group(c.lt_pulls),
+            group(c.rt_pulls)
+        ));
+    }
+    text
+}
+
+fn totals(c: Bucket) -> String {
+    format!("{} inputs: {}", group(c.total()), breakdown(c))
 }
 
 fn day_label(date: Date) -> String {
-    let weekday = WEEKDAYS[(date.to_days() + 4).rem_euclid(7) as usize];
-    format!("{weekday} {} {}", date.day, MONTHS[date.month as usize - 1])
+    format!(
+        "{} {} {} {}",
+        WEEKDAYS[date.weekday()],
+        date.day,
+        MONTHS[date.month as usize - 1],
+        date.year
+    )
 }
 
-fn day_row(ui: &mut egui::Ui, date: Date, c: Counts, max: u64) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 36.0), Sense::hover());
-    let painter = ui.painter();
-    let mid = rect.top() + 9.0;
-    let body = FontId::proportional(14.0);
-    painter.text(
-        pos2(rect.left(), mid),
-        Align2::LEFT_CENTER,
-        day_label(date),
-        body.clone(),
-        BRAND_FG,
-    );
-    painter.text(
-        pos2(rect.right() - 4.0, mid),
-        Align2::RIGHT_CENTER,
-        group(c.total()),
-        body,
-        BRAND_COTTONTAIL,
-    );
-    let track = Rect::from_min_max(
-        pos2(rect.left() + DATE_WIDTH, mid - 4.0),
-        pos2(rect.right() - TOTAL_WIDTH, mid + 4.0),
-    );
-    painter.rect_filled(track, 4.0, BRAND_BG_LIGHTEST);
-    if c.total() > 0 && max > 0 {
-        let share = (c.total() as f32 / max as f32).max(0.02);
-        let mut fill = track;
-        fill.set_width(track.width() * share);
-        painter.rect_filled(fill, 4.0, BRAND_PRIMARY);
+fn month_labels(start: Date) -> Vec<(usize, String)> {
+    (0..CALENDAR_WEEKS)
+        .filter_map(|week| {
+            let monday = start.plus_days(week as i64 * 7);
+            let sunday = monday.plus_days(6);
+            (week > 0 && sunday.day <= 7)
+                .then(|| (week, MONTHS[sunday.month as usize - 1].to_string()))
+        })
+        .collect()
+}
+
+fn heat(value: u64, max: u64) -> Color32 {
+    if value == 0 || max == 0 {
+        return BRAND_BG_LIGHT;
     }
-    painter.text(
-        pos2(track.left(), mid + 16.0),
-        Align2::LEFT_CENTER,
-        breakdown(c),
-        FontId::proportional(11.0),
-        BRAND_FG_WEAK,
-    );
+    let t = (value as f32 / max as f32).sqrt();
+    if t < 0.5 {
+        BRAND_PRIMARY_TINT.lerp_to_gamma(BRAND_PRIMARY, 0.25 + t * 1.5)
+    } else {
+        BRAND_PRIMARY.lerp_to_gamma(BRAND_COTTONTAIL, (t - 0.5) * 2.0)
+    }
+}
+
+/// Columns left to right, rows top to bottom (Monday first). Returns the hovered cell; a click
+/// pins a cell, a second click on it unpins.
+fn heatmap(
+    ui: &mut egui::Ui,
+    (cols, rows): (usize, usize),
+    col_labels: &[(usize, String)],
+    exists: &dyn Fn((usize, usize)) -> bool,
+    value: &dyn Fn((usize, usize)) -> u64,
+    max: u64,
+    pinned: &mut Option<(usize, usize)>,
+) -> Option<(usize, usize)> {
+    let width = ui.available_width();
+    let cell_w = ((width - LABEL_WIDTH) / cols as f32 - GAP).max(1.0);
+    let cell_h = cell_w.clamp(4.0, 14.0);
+    let height = LABEL_HEIGHT + rows as f32 * (cell_h + GAP);
+    let (rect, response) = ui.allocate_exact_size(vec2(width, height), Sense::click());
+    let origin = rect.min + vec2(LABEL_WIDTH, LABEL_HEIGHT);
+    let cell_at = |p: egui::Pos2| {
+        let rel = p - origin;
+        let (col, row) = (
+            (rel.x / (cell_w + GAP)).floor(),
+            (rel.y / (cell_h + GAP)).floor(),
+        );
+        (col >= 0.0 && row >= 0.0 && (col as usize) < cols && (row as usize) < rows)
+            .then_some((col as usize, row as usize))
+            .filter(|pos| exists(*pos))
+    };
+    let hovered = response.hover_pos().and_then(cell_at);
+    if response.clicked()
+        && let Some(pos) = response.interact_pointer_pos().and_then(cell_at)
+    {
+        *pinned = if *pinned == Some(pos) {
+            None
+        } else {
+            Some(pos)
+        };
+    }
+
+    let painter = ui.painter_at(rect);
+    let small = FontId::proportional(10.0);
+    for (row, name) in WEEKDAYS.iter().enumerate().take(rows) {
+        if rows < 7 || row % 2 == 0 {
+            painter.text(
+                pos2(
+                    rect.left(),
+                    origin.y + row as f32 * (cell_h + GAP) + cell_h / 2.0,
+                ),
+                Align2::LEFT_CENTER,
+                *name,
+                small.clone(),
+                BRAND_FG_WEAK,
+            );
+        }
+    }
+    for (col, text) in col_labels {
+        painter.text(
+            pos2(origin.x + *col as f32 * (cell_w + GAP), rect.top()),
+            Align2::LEFT_TOP,
+            text,
+            small.clone(),
+            BRAND_FG_WEAK,
+        );
+    }
+    for col in 0..cols {
+        for row in 0..rows {
+            if !exists((col, row)) {
+                continue;
+            }
+            let min = origin + vec2(col as f32 * (cell_w + GAP), row as f32 * (cell_h + GAP));
+            let cell = Rect::from_min_size(min, Vec2::new(cell_w, cell_h));
+            painter.rect_filled(cell, 2.0, heat(value((col, row)), max));
+            if *pinned == Some((col, row)) || hovered == Some((col, row)) {
+                painter.rect_stroke(
+                    cell.expand(1.0),
+                    2.0,
+                    Stroke::new(1.0, BRAND_COTTONTAIL),
+                    egui::StrokeKind::Outside,
+                );
+            }
+        }
+    }
+    hovered
 }
 
 fn apply_theme(ctx: &egui::Context) {
@@ -302,6 +566,36 @@ mod tests {
             month: 11,
             day: 20,
         };
-        assert_eq!(day_label(date), "Fri 20 Nov");
+        assert_eq!(day_label(date), "Fri 20 Nov 2026");
+    }
+
+    #[test]
+    fn month_labels_mark_the_first_week_of_each_month() {
+        let start = Date {
+            year: 2025,
+            month: 11,
+            day: 17,
+        };
+        let labels = month_labels(start);
+        assert_eq!(labels[0], (2, "Dec".to_string()));
+        assert_eq!(labels.len(), 12);
+    }
+
+    #[test]
+    fn breakdown_adds_controller_only_when_present() {
+        let mut b = Bucket {
+            keys: 1_234,
+            ..Default::default()
+        };
+        assert_eq!(breakdown(b), "1,234 keys · 0 clicks · 0 scrolls");
+        b.lt_pulls = 3;
+        assert_eq!(
+            breakdown(b),
+            "1,234 keys · 0 clicks · 0 scrolls · 0 buttons · LT 3 · RT 0"
+        );
+        assert_eq!(
+            totals(b),
+            "1,237 inputs: 1,234 keys · 0 clicks · 0 scrolls · 0 buttons · LT 3 · RT 0"
+        );
     }
 }

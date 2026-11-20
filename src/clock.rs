@@ -4,10 +4,10 @@ use std::time::Duration;
 use windows::Win32::System::SystemInformation::GetLocalTime;
 
 pub const FLUSH_INTERVAL: Duration = Duration::from_secs(30);
-const DAY_MS: u32 = 24 * 60 * 60 * 1000;
-/// Sleep a little past midnight so the next read of the clock is already on the new day.
-const PAST_MIDNIGHT_MS: u32 = 50;
-/// A flush this soon after midnight is the day-boundary flush and still belongs to the old day.
+const HOUR_MS: u32 = 60 * 60 * 1000;
+/// Sleep a little past the hour so the next read of the clock is already in the new hour.
+const PAST_BOUNDARY_MS: u32 = 50;
+/// A flush this soon after the hour is the boundary flush and still belongs to the old hour.
 const BOUNDARY_GRACE_MS: u32 = 60 * 1000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -51,6 +51,138 @@ impl Date {
     pub fn minus_days(self, n: i64) -> Self {
         Self::from_days(self.to_days() - n)
     }
+
+    pub fn plus_days(self, n: i64) -> Self {
+        Self::from_days(self.to_days() + n)
+    }
+
+    /// 0 = Monday .. 6 = Sunday.
+    pub fn weekday(self) -> usize {
+        (self.to_days() + 3).rem_euclid(7) as usize
+    }
+
+    pub fn monday(self) -> Self {
+        self.minus_days(self.weekday() as i64)
+    }
+
+    pub fn month(self) -> Month {
+        Month {
+            year: self.year,
+            month: self.month,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Month {
+    pub year: i32,
+    pub month: u32,
+}
+
+impl fmt::Display for Month {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:04}-{:02}", self.year, self.month)
+    }
+}
+
+impl Month {
+    pub fn parse(text: &str) -> Option<Self> {
+        let (year, month) = text.split_once('-')?;
+        if year.len() != 4 || month.len() != 2 {
+            return None;
+        }
+        let month = Self {
+            year: year.parse().ok()?,
+            month: month.parse().ok()?,
+        };
+        (1..=12).contains(&month.month).then_some(month)
+    }
+
+    pub fn first(self) -> Date {
+        Date {
+            year: self.year,
+            month: self.month,
+            day: 1,
+        }
+    }
+
+    pub fn next(self) -> Self {
+        if self.month == 12 {
+            Self {
+                year: self.year + 1,
+                month: 1,
+            }
+        } else {
+            Self {
+                year: self.year,
+                month: self.month + 1,
+            }
+        }
+    }
+
+    pub fn previous(self) -> Self {
+        if self.month == 1 {
+            Self {
+                year: self.year - 1,
+                month: 12,
+            }
+        } else {
+            Self {
+                year: self.year,
+                month: self.month - 1,
+            }
+        }
+    }
+}
+
+/// One local clock hour. A DST fall-back hour happens twice and both land in the same `Hour`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Hour {
+    pub date: Date,
+    pub hour: u32,
+}
+
+impl fmt::Display for Hour {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}T{:02}", self.date, self.hour)
+    }
+}
+
+impl Hour {
+    pub fn start_of(date: Date) -> Self {
+        Self { date, hour: 0 }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        let (date, hour) = text.split_once('T')?;
+        let (month, day) = date.rsplit_once('-')?;
+        let month = Month::parse(month)?;
+        if day.len() != 2 || hour.len() != 2 {
+            return None;
+        }
+        let date = Date {
+            year: month.year,
+            month: month.month,
+            day: day.parse().ok()?,
+        };
+        let hour: u32 = hour.parse().ok()?;
+        (hour < 24 && Date::from_days(date.to_days()) == date).then_some(Self { date, hour })
+    }
+
+    pub fn index(self) -> i64 {
+        self.date.to_days() * 24 + i64::from(self.hour)
+    }
+
+    pub fn from_index(index: i64) -> Self {
+        Self {
+            date: Date::from_days(index.div_euclid(24)),
+            hour: index.rem_euclid(24) as u32,
+        }
+    }
+
+    pub fn plus(self, hours: i64) -> Self {
+        Self::from_index(self.index() + hours)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,6 +207,13 @@ impl LocalTime {
         }
     }
 
+    pub fn hour(&self) -> Hour {
+        Hour {
+            date: self.date,
+            hour: self.ms_of_day / HOUR_MS,
+        }
+    }
+
     pub fn stamp(&self) -> String {
         let s = self.ms_of_day / 1000;
         format!(
@@ -89,22 +228,22 @@ impl LocalTime {
     }
 }
 
-pub fn today() -> Date {
-    LocalTime::now().date
+pub fn now_hour() -> Hour {
+    LocalTime::now().hour()
 }
 
 pub fn flush_wait(now: LocalTime) -> Duration {
-    let to_midnight = DAY_MS.saturating_sub(now.ms_of_day) + PAST_MIDNIGHT_MS;
-    FLUSH_INTERVAL.min(Duration::from_millis(u64::from(to_midnight)))
+    let to_next_hour = HOUR_MS - now.ms_of_day % HOUR_MS + PAST_BOUNDARY_MS;
+    FLUSH_INTERVAL.min(Duration::from_millis(u64::from(to_next_hour)))
 }
 
-/// The day a flush credits: the day the interval started on, unless the clock is well into a
-/// later day (the PC slept through midnight), where the taps are fresh and belong to today.
-pub fn credit_date(started: Date, now: LocalTime) -> Date {
-    if now.date == started || now.ms_of_day < BOUNDARY_GRACE_MS {
+/// The hour a flush credits: the hour the interval started in, unless the clock is well into a
+/// later hour (the PC slept through the boundary), where the taps are fresh and belong to now.
+pub fn credit_hour(started: Hour, now: LocalTime) -> Hour {
+    if now.hour() == started || now.ms_of_day % HOUR_MS < BOUNDARY_GRACE_MS {
         started
     } else {
-        now.date
+        now.hour()
     }
 }
 
@@ -149,33 +288,119 @@ mod tests {
         );
     }
 
+    fn hour(d: Date, h: u32) -> Hour {
+        Hour { date: d, hour: h }
+    }
+
     #[test]
-    fn waits_the_interval_during_the_day() {
+    fn waits_the_interval_mid_hour() {
         assert_eq!(
-            flush_wait(at(date(2026, 11, 20), 12, 0, 0, 0)),
+            flush_wait(at(date(2026, 11, 20), 12, 10, 0, 0)),
             FLUSH_INTERVAL
         );
     }
 
     #[test]
-    fn wakes_just_past_midnight() {
+    fn wakes_just_past_the_hour() {
+        let wait = flush_wait(at(date(2026, 11, 20), 13, 59, 50, 0));
+        assert_eq!(wait, Duration::from_millis(10_050));
         let wait = flush_wait(at(date(2026, 11, 20), 23, 59, 50, 0));
         assert_eq!(wait, Duration::from_millis(10_050));
     }
 
     #[test]
-    fn boundary_flush_credits_the_old_day() {
-        let old = date(2026, 11, 20);
-        let new = date(2026, 11, 21);
-        assert_eq!(credit_date(old, at(old, 23, 59, 59, 900)), old);
-        assert_eq!(credit_date(old, at(new, 0, 0, 0, 50)), old);
-        assert_eq!(credit_date(new, at(new, 0, 0, 30, 0)), new);
+    fn boundary_flush_credits_the_old_hour() {
+        let day = date(2026, 11, 20);
+        assert_eq!(
+            credit_hour(hour(day, 13), at(day, 13, 59, 59, 900)),
+            hour(day, 13)
+        );
+        assert_eq!(
+            credit_hour(hour(day, 13), at(day, 14, 0, 0, 50)),
+            hour(day, 13)
+        );
+        assert_eq!(
+            credit_hour(hour(day, 14), at(day, 14, 0, 30, 0)),
+            hour(day, 14)
+        );
     }
 
     #[test]
-    fn slept_through_midnight_credits_today() {
+    fn midnight_flush_credits_the_old_day() {
+        let old = date(2026, 11, 20);
+        let new = date(2026, 11, 21);
+        assert_eq!(
+            credit_hour(hour(old, 23), at(new, 0, 0, 0, 50)),
+            hour(old, 23)
+        );
+    }
+
+    #[test]
+    fn slept_through_the_hour_credits_now() {
         let old = date(2026, 11, 20);
         let later = date(2026, 11, 22);
-        assert_eq!(credit_date(old, at(later, 8, 15, 0, 0)), later);
+        assert_eq!(
+            credit_hour(hour(old, 23), at(later, 8, 15, 0, 0)),
+            hour(later, 8)
+        );
+        assert_eq!(
+            credit_hour(hour(old, 9), at(old, 11, 5, 0, 0)),
+            hour(old, 11)
+        );
+    }
+
+    #[test]
+    fn hour_keys_round_trip() {
+        let h = hour(date(2026, 3, 7), 5);
+        assert_eq!(h.to_string(), "2026-03-07T05");
+        assert_eq!(Hour::parse("2026-03-07T05"), Some(h));
+        for bad in [
+            "2026-02-30T05",
+            "2026-03-07T24",
+            "2026-13-01T00",
+            "2026-3-07T05",
+            "x",
+            "",
+        ] {
+            assert_eq!(Hour::parse(bad), None, "{bad}");
+        }
+        assert_eq!(
+            Month::parse("2026-11").map(|m| m.to_string()).as_deref(),
+            Some("2026-11")
+        );
+        assert_eq!(Month::parse("2026-11.corrupt-x"), None);
+    }
+
+    #[test]
+    fn hour_steps_cross_days() {
+        let h = hour(date(2026, 12, 31), 23);
+        assert_eq!(h.plus(1), hour(date(2027, 1, 1), 0));
+        assert_eq!(hour(date(2027, 1, 1), 0).plus(-1), h);
+        assert!(hour(date(2026, 11, 20), 23) < hour(date(2026, 11, 21), 0));
+    }
+
+    #[test]
+    fn weeks_start_on_monday() {
+        assert_eq!(date(2026, 11, 16).weekday(), 0);
+        assert_eq!(date(2026, 11, 20).weekday(), 4);
+        assert_eq!(date(2026, 11, 22).weekday(), 6);
+        assert_eq!(date(2026, 11, 22).monday(), date(2026, 11, 16));
+        assert_eq!(date(2026, 11, 16).monday(), date(2026, 11, 16));
+        assert_eq!(date(2027, 1, 2).monday(), date(2026, 12, 28));
+    }
+
+    #[test]
+    fn months_wrap_years() {
+        let jan = Month {
+            year: 2027,
+            month: 1,
+        };
+        let dec = Month {
+            year: 2026,
+            month: 12,
+        };
+        assert_eq!(jan.previous(), dec);
+        assert_eq!(dec.next(), jan);
+        assert_eq!(date(2028, 2, 29).month().first(), date(2028, 2, 1));
     }
 }

@@ -2,8 +2,13 @@
 
 mod autostart;
 mod clock;
+mod controller;
 mod counts;
+mod fireworks;
 mod hooks;
+mod milestones;
+mod settings;
+mod stats;
 mod storage;
 mod tray;
 mod ui;
@@ -33,8 +38,10 @@ fn main() -> eframe::Result {
     let dir = storage::data_dir();
     let first_run = !dir.exists();
     storage::init(&dir);
+    settings::init(&dir);
     autostart::init(first_run);
     hooks::spawn();
+    controller::spawn();
     storage::spawn_flusher();
     let (open_tx, open_rx) = std::sync::mpsc::channel();
     tray::spawn(open_tx);
@@ -50,8 +57,8 @@ fn main() -> eframe::Result {
                 eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
                     .expect("bundled icon"),
             )
-            .with_inner_size([360.0, 480.0])
-            .with_min_inner_size([320.0, 360.0]),
+            .with_inner_size([400.0, 640.0])
+            .with_min_inner_size([340.0, 420.0]),
         ..Default::default()
     };
     eframe::run_native(

@@ -123,3 +123,10 @@ Every design choice must meet these:
 - Unit tests cover the pure logic: the repeat filter, notch math, day rollover, storage load/merge and corrupt-file handling.
 - `--background`, a second launch, autostart registration and the tray quit flush were all tried by hand on this machine, with notes in the report on what was verified and how.
 - The README follows looking-glass's shape: what it is, Use, privacy line, Build.
+
+First-release additions (t4: storage v2, controller, stats window, milestones, fireworks):
+- Storage v2 is month-sharded (`counts/YYYY-MM.json`, version 2, hourly buckets, zero fields omitted); a flush rewrites only dirty months and an idle flush writes nothing. Tests cover the round trip, merge, per-shard corrupt and locked-file handling, and the hour-boundary flush credit.
+- `settings.json` holds overlay on/off and position, the fireworks opt-in and the celebrated set, with the same atomic write and never-overwrite-unreadable rule.
+- Controller counting takes a backend-neutral snapshot (buttons bitmask in XInput's layout, triggers 0..1). Tests feed fake states for button transitions, trigger pulls at the threshold, the engaged-ms accumulator and the poll schedule (connected slots only, probes on device change and every 10 s).
+- Tests cover period bounds (Monday weeks, month and year wraps), heatmap bucketing and milestone crossing.
+- The report lists idle CPU and working set, hidden and visible, and what was checked by hand in the window.

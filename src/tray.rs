@@ -11,12 +11,14 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     ASFW_ANY, AllowSetForegroundWindow, CreateWindowExW, DefWindowProcW, DispatchMessageW,
     FindWindowW, GetMessageW, MSG, PostMessageW, RegisterClassW, SetTimer, TranslateMessage,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_ENDSESSION, WM_QUERYENDSESSION, WM_TIMER, WNDCLASSW,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_DEVICECHANGE, WM_ENDSESSION, WM_QUERYENDSESSION,
+    WM_TIMER, WNDCLASSW,
 };
 use windows::core::w;
 
-use crate::counts::{self, Counts};
-use crate::{autostart, clock, storage, ui};
+use crate::clock::Hour;
+use crate::counts::{self, Bucket};
+use crate::{autostart, clock, controller, milestones, settings, storage, ui};
 
 const CLASS: windows::core::PCWSTR = w!("tippy-taps-instance");
 const WM_SHOW: u32 = WM_APP + 1;
@@ -35,7 +37,9 @@ static WINDOW: AtomicIsize = AtomicIsize::new(0);
 struct Tray {
     icon: TrayIcon,
     autostart: CheckMenuItem,
+    fireworks: CheckMenuItem,
     tooltip: String,
+    seen: Option<(u64, Hour, Bucket)>,
 }
 
 thread_local! {
@@ -57,7 +61,7 @@ pub fn show_running_instance() -> bool {
     false
 }
 
-pub fn sync_autostart() {
+pub fn sync_menu() {
     post(WM_SYNC);
 }
 
@@ -118,8 +122,16 @@ pub fn spawn(open: Sender<()>) {
 fn build() -> Result<Tray, Box<dyn std::error::Error>> {
     let open = MenuItem::new("Open", true, None);
     let autostart = CheckMenuItem::new("Start with Windows", true, autostart::enabled(), None);
+    let fireworks =
+        CheckMenuItem::new("Fireworks at milestones", true, settings::fireworks(), None);
     let quit = MenuItem::new("Quit", true, None);
-    let menu = Menu::with_items(&[&open, &autostart, &PredefinedMenuItem::separator(), &quit])?;
+    let menu = Menu::with_items(&[
+        &open,
+        &autostart,
+        &fireworks,
+        &PredefinedMenuItem::separator(),
+        &quit,
+    ])?;
 
     let tooltip = current_tooltip();
     let icon = TrayIconBuilder::new()
@@ -129,14 +141,24 @@ fn build() -> Result<Tray, Box<dyn std::error::Error>> {
         .with_menu_on_left_click(false)
         .build()?;
 
-    let (open_id, autostart_id, quit_id) =
-        (open.id().clone(), autostart.id().clone(), quit.id().clone());
+    let (open_id, autostart_id, fireworks_id, quit_id) = (
+        open.id().clone(),
+        autostart.id().clone(),
+        fireworks.id().clone(),
+        quit.id().clone(),
+    );
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
         if event.id == open_id {
             show();
         } else if event.id == autostart_id {
             let _ = autostart::set(!autostart::enabled());
             post(WM_SYNC);
+        } else if event.id == fireworks_id {
+            settings::update(|s| s.fireworks = !s.fireworks);
+            post(WM_SYNC);
+            if let Some(ctx) = CTX.get() {
+                ctx.request_repaint();
+            }
         } else if event.id == quit_id {
             post(WM_QUIT_APP);
         }
@@ -155,7 +177,9 @@ fn build() -> Result<Tray, Box<dyn std::error::Error>> {
     Ok(Tray {
         icon,
         autostart,
+        fireworks,
         tooltip,
+        seen: None,
     })
 }
 
@@ -179,12 +203,12 @@ fn icon() -> Result<tray_icon::Icon, Box<dyn std::error::Error>> {
 
 fn current_tooltip() -> String {
     let storage = storage::get();
-    let mut c = storage.day(clock::today());
+    let mut c = storage.day(clock::now_hour().date);
     c += counts::pending();
     tooltip(c, storage.saving_blocked())
 }
 
-pub fn tooltip(c: Counts, saving_blocked: bool) -> String {
+pub fn tooltip(c: Bucket, saving_blocked: bool) -> String {
     let mut text = format!(
         "Today: {} keys · {} clicks · {} scrolls",
         counts::group(c.keys),
@@ -217,24 +241,39 @@ fn post(message: u32) {
     }
 }
 
+/// Runs every 2 s, but skips the tooltip and milestone work unless a count or the hour changed.
 fn refresh() {
     TRAY.with(|t| {
         let mut t = t.borrow_mut();
         let Some(tray) = t.as_mut() else { return };
-        let text = current_tooltip();
-        if text != tray.tooltip {
-            let _ = tray.icon.set_tooltip(Some(&text));
-            tray.tooltip = text;
+        let seen = (storage::revision(), clock::now_hour(), counts::pending());
+        if tray.seen != Some(seen) {
+            tray.seen = Some(seen);
+            if milestones::check_storage(seen.2)
+                && ui::shown()
+                && let Some(ctx) = CTX.get()
+            {
+                ctx.request_repaint();
+            }
+            let text = current_tooltip();
+            if text != tray.tooltip {
+                let _ = tray.icon.set_tooltip(Some(&text));
+                tray.tooltip = text;
+            }
         }
         let on = autostart::enabled();
         if tray.autostart.is_checked() != on {
             tray.autostart.set_checked(on);
         }
+        let on = settings::fireworks();
+        if tray.fireworks.is_checked() != on {
+            tray.fireworks.set_checked(on);
+        }
     });
 }
 
 fn quit() -> ! {
-    storage::flush(clock::today());
+    storage::flush(clock::now_hour());
     // Dropping the icon removes it now; process::exit alone would leave a ghost icon in the tray.
     TRAY.with(|t| drop(t.borrow_mut().take()));
     std::process::exit(0);
@@ -251,13 +290,17 @@ unsafe extern "system" fn window_proc(
         WM_SYNC | WM_TIMER => refresh(),
         WM_QUIT_APP => quit(),
         WM_QUERYENDSESSION => {
-            storage::flush(clock::today());
+            storage::flush(clock::now_hour());
             return LRESULT(1);
         }
         WM_ENDSESSION => {
             if wparam.0 != 0 {
-                storage::flush(clock::today());
+                storage::flush(clock::now_hour());
             }
+        }
+        WM_DEVICECHANGE => {
+            controller::device_changed();
+            return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
         }
         _ => return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
     }
@@ -270,10 +313,11 @@ mod tests {
 
     #[test]
     fn tooltip_text() {
-        let c = Counts {
+        let c = Bucket {
             keys: 12345,
             clicks: 678,
             scrolls: 90,
+            ..Default::default()
         };
         assert_eq!(
             tooltip(c, false),
