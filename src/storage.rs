@@ -134,14 +134,17 @@ impl Storage {
     pub fn merge_history(&mut self, history: HistoryRead) {
         match history.0 {
             Ok(days) => {
+                let was_unlisted = self.history == History::Unlisted;
+                let kept = self.error.take();
+                let failed = days.iter().any(|(_, r)| r.is_err());
                 self.history = History::Loaded;
                 for (date, result) in days {
                     if !self.read.contains(&date) && !self.held(date) {
                         self.apply_day(date, result);
                     }
                 }
-                if self.clear() {
-                    self.error = None;
+                if !failed {
+                    self.error = if was_unlisted { None } else { kept };
                 }
             }
             Err(err) => {
@@ -267,8 +270,19 @@ impl Storage {
                     let name = p.file_name().unwrap_or_default().to_string_lossy();
                     self.notice = Some(format!("A file was unreadable and was moved to {name}"));
                 }
-                if self.unsplit.remove(&month) {
-                    for date in list_days(&self.dir).unwrap_or_default() {
+                if self.unsplit.contains(&month) {
+                    let days = match list_days(&self.dir) {
+                        Ok(days) => days,
+                        Err(err) => {
+                            self.error = Some(format!(
+                                "Can't open {}: {err}. Counting in memory and retrying every 30 s.",
+                                self.dir.display()
+                            ));
+                            return;
+                        }
+                    };
+                    self.unsplit.remove(&month);
+                    for date in days {
                         if date.month() == month && !self.read.contains(&date) {
                             self.load_day(date, stamp);
                         }
@@ -352,7 +366,10 @@ fn list_days(dir: &Path) -> io::Result<Vec<Date>> {
 /// v0.1 month file to day files: plan the merged days into a journal, write and re-read each
 /// day file, then keep the month file as a backup. A crash before the journal is complete has
 /// touched no day file, so the split starts over; after it, the journal holds the final values
-/// and is written again as is, so a resumed split never adds a month twice.
+/// and is written again as is, so a resumed split never adds a month twice. Day files that
+/// already match the plan are left alone, so a split retried every flush writes nothing new. An
+/// unreadable journal is an error, never moved aside: planning again would add the month twice
+/// to the days already written.
 fn split_month(dir: &Path, month: Month, stamp: &str) -> io::Result<Vec<PathBuf>> {
     let shard = dir.join(format!("{month}.json"));
     let journal = dir.join(format!("{month}{SPLIT_SUFFIX}.json"));
@@ -361,9 +378,17 @@ fn split_month(dir: &Path, month: Month, stamp: &str) -> io::Result<Vec<PathBuf>
         remove_if_exists(&journal)?;
         return Ok(moved);
     }
-    let resumed = load_shard(&journal, month, stamp)?;
-    moved.extend(resumed.moved_to);
-    let plan = match resumed.value {
+    let resumed = match std::fs::read(&journal) {
+        Ok(bytes) => Some(
+            serde_json::from_slice(&bytes)
+                .ok()
+                .and_then(|shard| accept_hours(shard, |h| h.date.month() == month))
+                .ok_or_else(|| io::Error::other(format!("{} is unreadable", journal.display())))?,
+        ),
+        Err(err) if err.kind() == ErrorKind::NotFound => None,
+        Err(err) => return Err(err),
+    };
+    let plan = match resumed {
         Some(plan) => plan,
         None => {
             let loaded = load_shard(&shard, month, stamp)?;
@@ -390,6 +415,9 @@ fn split_month(dir: &Path, month: Month, stamp: &str) -> io::Result<Vec<PathBuf>
             .into_iter()
             .filter(|(_, b)| !b.is_empty())
             .collect();
+        if read_day(dir, date, stamp)?.value.as_ref() == Some(&day) {
+            continue;
+        }
         save_day(dir, date, &day)?;
         if read_day(dir, date, stamp)?.value.unwrap_or_default() != day {
             return Err(io::Error::other(format!(
@@ -525,20 +553,22 @@ fn read_hours(
     stamp: &str,
     belongs: impl Fn(Hour) -> bool,
 ) -> io::Result<Loaded<Hours>> {
-    read_json(path, stamp, |shard: Shard| {
-        if shard.version != VERSION {
-            return None;
-        }
-        shard
-            .hours
-            .into_iter()
-            .map(|(key, bucket)| {
-                Hour::parse(&key)
-                    .filter(|h| belongs(*h))
-                    .map(|h| (h, bucket))
-            })
-            .collect()
-    })
+    read_json(path, stamp, |shard: Shard| accept_hours(shard, belongs))
+}
+
+fn accept_hours(shard: Shard, belongs: impl Fn(Hour) -> bool) -> Option<Hours> {
+    if shard.version != VERSION {
+        return None;
+    }
+    shard
+        .hours
+        .into_iter()
+        .map(|(key, bucket)| {
+            Hour::parse(&key)
+                .filter(|h| belongs(*h))
+                .map(|h| (h, bucket))
+        })
+        .collect()
 }
 
 fn load_shard(path: &Path, month: Month, stamp: &str) -> io::Result<Loaded<Hours>> {
@@ -1060,6 +1090,56 @@ mod tests {
         assert!(!dir.0.join("2026-11.json").exists());
         assert!(!dir.0.join("2026-11.split.json").exists());
         assert_eq!(open(&dir).total, resumed.total);
+    }
+
+    #[test]
+    fn unreadable_journal_holds_the_month_instead_of_planning_again() {
+        let dir = TempDir::new("split-bad-journal");
+        std::fs::write(dir.0.join("2026-11.json"), NOV_SHARD).unwrap();
+        dir.write_day(
+            11,
+            10,
+            r#"{"version":2,"hours":{"2026-11-10T08":{"keys":3}}}"#,
+        );
+        std::fs::write(dir.0.join("2026-11.split.json"), "{ torn").unwrap();
+        let storage = open(&dir);
+        assert!(!storage.complete());
+        assert!(storage.error.as_deref().unwrap().contains("split.json"));
+        assert_eq!(saved(&dir.day(11, 10))[&hour(2026, 11, 10, 8)], keys(3, 0));
+        assert!(dir.0.join("2026-11.split.json").exists());
+    }
+
+    #[test]
+    fn retried_split_rewrites_no_finished_day() {
+        let dir = TempDir::new("split-retry-writes");
+        std::fs::write(dir.0.join("2026-11.json"), NOV_SHARD).unwrap();
+        let blocker = dir.0.join("2026/11-15.json.tmp");
+        std::fs::create_dir_all(&blocker).unwrap();
+        let mut storage = open(&dir);
+        let first = std::fs::metadata(dir.day(11, 10))
+            .unwrap()
+            .modified()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        storage.flush(hour(2026, 11, 20, 9), Bucket::default(), "x");
+        let again = std::fs::metadata(dir.day(11, 10))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(first, again);
+    }
+
+    #[test]
+    fn a_save_error_outlives_the_history_merge() {
+        let dir = TempDir::new("keep-error");
+        let mut storage = Storage::open_today(dir.0.clone(), TODAY, "x");
+        storage.error = Some("Can't save counts: disk full".into());
+        let history = read_history(&storage.dir, &storage.skip(), "x");
+        storage.merge_history(history);
+        assert_eq!(
+            storage.error.as_deref(),
+            Some("Can't save counts: disk full")
+        );
     }
 
     #[test]
