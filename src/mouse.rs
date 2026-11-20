@@ -5,7 +5,13 @@ use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering, 
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use serde::{Deserialize, Serialize};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, TRUE, WPARAM};
+use windows::Win32::Devices::Display::{
+    DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+    DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
+    DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME, DisplayConfigGetDeviceInfo,
+    GetDisplayConfigBufferSizes, QDC_ONLY_ACTIVE_PATHS, QueryDisplayConfig,
+};
+use windows::Win32::Foundation::{ERROR_SUCCESS, HWND, LPARAM, LRESULT, RECT, TRUE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     DISPLAY_DEVICE_ACTIVE, DISPLAY_DEVICEW, EnumDisplayDevicesW, EnumDisplayMonitors,
     GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
@@ -657,16 +663,84 @@ fn displays() -> Vec<Display> {
             LPARAM(&mut handles as *mut _ as isize),
         );
     }
+    let names = friendly_names();
     handles
         .into_iter()
-        .filter_map(display)
+        .filter_map(|h| display(h, &names))
         .take(MAX_MONITORS)
+        .collect()
+}
+
+struct Named {
+    output: String,
+    path: String,
+    name: String,
+}
+
+/// The EDID model names ("DELL U2720Q") that `EnumDisplayDevicesW` reports only as "Generic PnP
+/// Monitor".
+fn friendly_names() -> Vec<Named> {
+    let (mut path_count, mut mode_count) = (0, 0);
+    let sized = unsafe {
+        GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count)
+    };
+    if sized != ERROR_SUCCESS {
+        return Vec::new();
+    }
+    let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
+    let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
+    let queried = unsafe {
+        QueryDisplayConfig(
+            QDC_ONLY_ACTIVE_PATHS,
+            &mut path_count,
+            paths.as_mut_ptr(),
+            &mut mode_count,
+            modes.as_mut_ptr(),
+            None,
+        )
+    };
+    if queried != ERROR_SUCCESS {
+        return Vec::new();
+    }
+    paths.truncate(path_count as usize);
+    paths
+        .iter()
+        .filter_map(|p| {
+            let mut source = DISPLAYCONFIG_SOURCE_DEVICE_NAME {
+                header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                    r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+                    size: size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32,
+                    adapterId: p.sourceInfo.adapterId,
+                    id: p.sourceInfo.id,
+                },
+                ..Default::default()
+            };
+            let mut target = DISPLAYCONFIG_TARGET_DEVICE_NAME {
+                header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                    r#type: DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+                    size: size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32,
+                    adapterId: p.targetInfo.adapterId,
+                    id: p.targetInfo.id,
+                },
+                ..Default::default()
+            };
+            let ok = unsafe {
+                DisplayConfigGetDeviceInfo(&mut source.header) == 0
+                    && DisplayConfigGetDeviceInfo(&mut target.header) == 0
+            };
+            let name = wide(&target.monitorFriendlyDeviceName);
+            (ok && !name.is_empty()).then(|| Named {
+                output: wide(&source.viewGdiDeviceName),
+                path: wide(&target.monitorDevicePath),
+                name,
+            })
+        })
         .collect()
 }
 
 /// Identifies a monitor by its device interface path, which survives reboots and re-plugs, with the
 /// output name and resolution as a fallback.
-fn display(monitor: HMONITOR) -> Option<Display> {
+fn display(monitor: HMONITOR, names: &[Named]) -> Option<Display> {
     let mut info = MONITORINFOEXW::default();
     info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
     let ok = unsafe { GetMonitorInfoW(monitor, &mut info as *mut _ as *mut MONITORINFO) };
@@ -714,7 +788,13 @@ fn display(monitor: HMONITOR) -> Option<Display> {
     } else {
         path
     };
-    let name = Some(name).filter(|n| !n.is_empty() && !n.starts_with("Generic "));
+    let gdi_name = wide(&info.szDevice);
+    let name = names
+        .iter()
+        .find(|n| n.path.eq_ignore_ascii_case(&id))
+        .or_else(|| names.iter().find(|n| n.output == gdi_name))
+        .map(|n| n.name.clone())
+        .or(Some(name).filter(|n| !n.is_empty() && !n.starts_with("Generic ")));
     Some(Display {
         id,
         name,
