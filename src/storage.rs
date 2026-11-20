@@ -264,12 +264,14 @@ impl Storage {
     /// A month split on a retry may hold days that are already in `hours` as unsaved counts;
     /// its files are read on top of them, like any day read late.
     fn split(&mut self, month: Month, stamp: &str) {
-        match split_month(&self.dir, month, stamp) {
-            Ok(moved) => {
-                for p in moved {
-                    let name = p.file_name().unwrap_or_default().to_string_lossy();
-                    self.notice = Some(format!("A file was unreadable and was moved to {name}"));
-                }
+        let mut moved = Vec::new();
+        let result = split_month(&self.dir, month, stamp, &mut moved);
+        for p in moved {
+            let name = p.file_name().unwrap_or_default().to_string_lossy();
+            self.notice = Some(format!("A file was unreadable and was moved to {name}"));
+        }
+        match result {
+            Ok(()) => {
                 if self.unsplit.contains(&month) {
                     let days = match list_days(&self.dir) {
                         Ok(days) => days,
@@ -367,44 +369,43 @@ fn list_days(dir: &Path) -> io::Result<Vec<Date>> {
 /// day file, then keep the month file as a backup. A crash before the journal is complete has
 /// touched no day file, so the split starts over; after it, the journal holds the final values
 /// and is written again as is, so a resumed split never adds a month twice. Day files that
-/// already match the plan are left alone, so a split retried every flush writes nothing new. An
-/// unreadable journal is an error, never moved aside: planning again would add the month twice
-/// to the days already written.
-fn split_month(dir: &Path, month: Month, stamp: &str) -> io::Result<Vec<PathBuf>> {
+/// already match the plan are left alone, so a split retried every flush writes nothing new.
+///
+/// A damaged journal is moved aside and the month is planned again. Some day files may already
+/// hold the old plan, and a day that holds at least the month's hours is taken as written: while
+/// the journal existed the month was held, so nothing else added to those days.
+fn split_month(dir: &Path, month: Month, stamp: &str, moved: &mut Vec<PathBuf>) -> io::Result<()> {
     let shard = dir.join(format!("{month}.json"));
     let journal = dir.join(format!("{month}{SPLIT_SUFFIX}.json"));
-    let mut moved = Vec::new();
     if !shard.exists() {
-        remove_if_exists(&journal)?;
-        return Ok(moved);
+        return remove_if_exists(&journal);
     }
-    let resumed = match std::fs::read(&journal) {
-        Ok(bytes) => Some(
-            serde_json::from_slice(&bytes)
-                .ok()
-                .and_then(|shard| accept_hours(shard, |h| h.date.month() == month))
-                .ok_or_else(|| io::Error::other(format!("{} is unreadable", journal.display())))?,
-        ),
-        Err(err) if err.kind() == ErrorKind::NotFound => None,
-        Err(err) => return Err(err),
-    };
-    let plan = match resumed {
+    let resumed = load_shard(&journal, month, stamp)?;
+    let damaged = resumed.moved_to.is_some();
+    moved.extend(resumed.moved_to);
+    let plan = match resumed.value {
         Some(plan) => plan,
         None => {
             let loaded = load_shard(&shard, month, stamp)?;
             if let Some(p) = loaded.moved_to {
                 moved.push(p);
-                return Ok(moved);
+                return Ok(());
             }
             let from_month = loaded.value.unwrap_or_default();
             let mut plan = Hours::new();
             for date in dates(&from_month) {
                 let existing = read_day(dir, date, stamp)?;
                 moved.extend(existing.moved_to);
-                plan.extend(existing.value.unwrap_or_default());
-            }
-            for (hour, bucket) in from_month {
-                *plan.entry(hour).or_default() += bucket;
+                let existing = existing.value.unwrap_or_default();
+                let written = damaged && holds(&existing, &day_hours(&from_month, date));
+                for (hour, bucket) in day_hours(&from_month, date) {
+                    if !written {
+                        *plan.entry(hour).or_default() += bucket;
+                    }
+                }
+                for (hour, bucket) in existing {
+                    *plan.entry(hour).or_default() += bucket;
+                }
             }
             save_hours(&journal, &plan)?;
             plan
@@ -415,20 +416,44 @@ fn split_month(dir: &Path, month: Month, stamp: &str) -> io::Result<Vec<PathBuf>
             .into_iter()
             .filter(|(_, b)| !b.is_empty())
             .collect();
-        if read_day(dir, date, stamp)?.value.as_ref() == Some(&day) {
+        let current = read_day(dir, date, stamp)?;
+        moved.extend(current.moved_to);
+        if current.value.as_ref() == Some(&day) {
             continue;
         }
         save_day(dir, date, &day)?;
-        if read_day(dir, date, stamp)?.value.unwrap_or_default() != day {
+        let back = read_day(dir, date, stamp)?;
+        moved.extend(back.moved_to);
+        if back.value.unwrap_or_default() != day {
             return Err(io::Error::other(format!(
                 "{} did not read back as written",
                 day_path(dir, date).display()
             )));
         }
     }
-    std::fs::rename(&shard, dir.join(format!("{month}.json{BACKUP_SUFFIX}")))?;
-    remove_if_exists(&journal)?;
-    Ok(moved)
+    std::fs::rename(&shard, free_backup(dir, month, stamp))?;
+    remove_if_exists(&journal)
+}
+
+fn holds(file: &Hours, from_month: &Hours) -> bool {
+    from_month.iter().all(|(hour, want)| {
+        file.get(hour).is_some_and(|have| {
+            have.to_array()
+                .iter()
+                .zip(want.to_array())
+                .all(|(have, want)| *have >= want)
+        })
+    })
+}
+
+/// An older backup (a downgrade to v0.1 and back) is never replaced.
+fn free_backup(dir: &Path, month: Month, stamp: &str) -> PathBuf {
+    let base = format!("{month}.json{BACKUP_SUFFIX}");
+    std::iter::once(base.clone())
+        .chain((1..).map(|n| format!("{base}-{stamp}-{n}")))
+        .map(|name| dir.join(name))
+        .find(|path| !path.exists())
+        .expect("an unused name")
 }
 
 fn remove_if_exists(path: &Path) -> io::Result<()> {
@@ -1093,20 +1118,74 @@ mod tests {
     }
 
     #[test]
-    fn unreadable_journal_holds_the_month_instead_of_planning_again() {
+    fn damaged_journal_is_moved_aside_and_the_split_recovers_once() {
         let dir = TempDir::new("split-bad-journal");
         std::fs::write(dir.0.join("2026-11.json"), NOV_SHARD).unwrap();
         dir.write_day(
             11,
             10,
-            r#"{"version":2,"hours":{"2026-11-10T08":{"keys":3}}}"#,
+            r#"{"version":2,"hours":{"2026-11-10T08":{"keys":3},"2026-11-10T09":{"keys":1}}}"#,
+        );
+        dir.write_day(
+            11,
+            15,
+            r#"{"version":2,"hours":{"2026-11-15T09":{"keys":4}}}"#,
         );
         std::fs::write(dir.0.join("2026-11.split.json"), "{ torn").unwrap();
+
+        let mut storage = open(&dir);
+        assert!(storage.complete());
+        assert!(storage.error.is_none());
+        assert!(
+            storage
+                .notice
+                .as_deref()
+                .unwrap()
+                .contains("2026-11.split.corrupt-x.json")
+        );
+        assert!(dir.0.join("2026-11.split.corrupt-x.json").exists());
+        assert_eq!(
+            saved(&dir.day(11, 10))[&hour(2026, 11, 10, 8)],
+            keys(3, 0),
+            "a day that already holds the month's hours is not added again"
+        );
+        assert_eq!(saved(&dir.day(11, 15))[&hour(2026, 11, 15, 8)], keys(5, 0));
+        assert_eq!(storage.total.keys, 3 + 1 + 5 + 4 + 2);
+
+        storage.flush(hour(2026, 11, 20, 9), keys(10, 0), "x");
+        assert_eq!(open(&dir).total, storage.total);
+    }
+
+    #[test]
+    fn corrupt_day_during_the_split_is_reported() {
+        let dir = TempDir::new("split-corrupt-day");
+        std::fs::write(dir.0.join("2026-11.json"), NOV_SHARD).unwrap();
+        dir.write_day(11, 15, "{ torn");
         let storage = open(&dir);
-        assert!(!storage.complete());
-        assert!(storage.error.as_deref().unwrap().contains("split.json"));
-        assert_eq!(saved(&dir.day(11, 10))[&hour(2026, 11, 10, 8)], keys(3, 0));
-        assert!(dir.0.join("2026-11.split.json").exists());
+        assert!(
+            storage
+                .notice
+                .as_deref()
+                .unwrap()
+                .contains("11-15.corrupt-x.json")
+        );
+        assert_eq!(storage.total.keys, 3 + 5 + 2);
+    }
+
+    #[test]
+    fn an_older_backup_is_never_replaced() {
+        let dir = TempDir::new("split-backup");
+        std::fs::write(dir.0.join("2026-11.json.v1-backup"), "older").unwrap();
+        std::fs::write(dir.0.join("2026-11.json"), NOV_SHARD).unwrap();
+        open(&dir);
+        assert_eq!(
+            std::fs::read_to_string(dir.0.join("2026-11.json.v1-backup")).unwrap(),
+            "older"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.0.join("2026-11.json.v1-backup-x-1")).unwrap(),
+            NOV_SHARD
+        );
     }
 
     #[test]
