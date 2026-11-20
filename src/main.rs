@@ -64,7 +64,7 @@ fn main() -> eframe::Result {
                     .expect("bundled icon"),
             )
             .with_inner_size([820.0, 640.0])
-            .with_min_inner_size([720.0, 560.0]),
+            .with_min_inner_size([720.0, 460.0]),
         ..Default::default()
     };
     eframe::run_native(

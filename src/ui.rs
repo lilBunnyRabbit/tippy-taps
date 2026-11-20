@@ -1,7 +1,7 @@
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::thread::Thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontFamily, FontId, Id, LayerId, Layout, Order,
@@ -32,6 +32,8 @@ const BRAND_ERROR: Color32 = Color32::from_rgb(0xf8, 0x88, 0x76);
 /// How often a shown window looks for new taps to drum; data repaints stay at `CHANGE_CHECK`.
 const DRUM_CHECK: Duration = Duration::from_millis(33);
 const CHANGE_CHECK: u32 = 15;
+/// Drumming repaints the whole window, so taps are batched to about 10 frames a second.
+const DRUM_FRAME: Duration = Duration::from_millis(100);
 const PAW_HOLD: f64 = 0.11;
 const PAGE_MARGIN: i8 = 24;
 const RABBIT_SIZE: f32 = 92.0;
@@ -136,6 +138,8 @@ fn spawn_watcher(ctx: egui::Context) {
             let mut alternate = false;
             let mut tick = 0;
             let mut trimmed = false;
+            let mut drum_due = false;
+            let mut last_drum = Instant::now();
             loop {
                 if !shown() {
                     if !trimmed {
@@ -159,6 +163,11 @@ fn spawn_watcher(ctx: egui::Context) {
                 pending = now;
                 if sides != 0 {
                     SIDES.fetch_or(sides, Ordering::Relaxed);
+                    drum_due = true;
+                }
+                if drum_due && last_drum.elapsed() >= DRUM_FRAME {
+                    drum_due = false;
+                    last_drum = Instant::now();
                     ctx.request_repaint();
                 }
                 tick = (tick + 1) % CHANGE_CHECK;
@@ -462,7 +471,7 @@ impl App {
         let frame = self.paws.frame(now, self.fireworks.active());
         if let Some(at) = self.paws.next_change(now) {
             ui.ctx()
-                .request_repaint_after(Duration::from_secs_f64(at - now));
+                .request_repaint_after(Duration::from_secs_f64(at - now).max(DRUM_FRAME));
         }
         let (rect, _) = ui.allocate_exact_size(Vec2::splat(RABBIT_SIZE), Sense::hover());
         let painter = ui.painter();
