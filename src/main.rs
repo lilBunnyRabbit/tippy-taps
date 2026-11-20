@@ -63,8 +63,8 @@ fn main() -> eframe::Result {
                 eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
                     .expect("bundled icon"),
             )
-            .with_inner_size([400.0, 640.0])
-            .with_min_inner_size([340.0, 420.0]),
+            .with_inner_size([820.0, 640.0])
+            .with_min_inner_size([720.0, 560.0]),
         ..Default::default()
     };
     eframe::run_native(

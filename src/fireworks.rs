@@ -19,7 +19,7 @@ struct Spark {
     color: Color32,
 }
 
-/// Placeholder show until the rabbit art lands: bursts of sparks plus a banner.
+/// Bursts of sparks plus a banner; the header rabbit plays its cheer frame while a show runs.
 pub struct Fireworks {
     sparks: Vec<Spark>,
     bursts_left: u32,

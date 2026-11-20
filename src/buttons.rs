@@ -10,14 +10,14 @@ use crate::settings;
 use crate::stats::{Period, Stats};
 use crate::ui::{
     BRAND_BG_LIGHT, BRAND_BG_LIGHTEST, BRAND_COTTONTAIL, BRAND_DARKER, BRAND_FG, BRAND_FG_WEAK,
-    Fingerprint, caption, heat, weak,
+    Fingerprint, heat, segmented, weak,
 };
 
 const KEYS_LINE: &str =
     "Counts presses per key position. Never what you typed, the order, or when.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Device {
+pub(crate) enum Device {
     Keyboard,
     Mouse,
     Controller,
@@ -71,23 +71,18 @@ impl Buttons {
         }
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, stats: &Stats, keys: &Counts, key: Fingerprint) {
-        caption(ui, "BUTTONS");
-        ui.horizontal(|ui| {
-            for (device, label) in [
-                (Device::Keyboard, "Keyboard"),
-                (Device::Mouse, "Mouse"),
-                (Device::Controller, "Controller"),
-            ] {
-                if ui.selectable_label(self.device == device, label).clicked()
-                    && self.device != device
-                {
-                    self.device = device;
-                    self.pinned = None;
-                }
-            }
-        });
-        ui.add_space(6.0);
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        device: Device,
+        stats: &Stats,
+        keys: &Counts,
+        key: Fingerprint,
+    ) {
+        if self.device != device {
+            self.device = device;
+            self.pinned = None;
+        }
         match self.device {
             Device::Keyboard => self.keyboard(ui, keys, key),
             Device::Mouse | Device::Controller => {
@@ -100,11 +95,11 @@ impl Buttons {
                 if self.device == Device::Mouse {
                     let parts = mouse(b);
                     let hovered =
-                        diagram(ui, MOUSE_UNITS, 16.0, &parts, &MOUSE_BODY, &mut self.pinned);
+                        diagram(ui, MOUSE_UNITS, 22.0, &parts, &MOUSE_BODY, &mut self.pinned);
                     self.detail(ui, &parts, hovered, "Hover or click a button for its count");
                 } else {
                     let parts = controller(b);
-                    let hovered = diagram(ui, PAD_UNITS, 22.0, &parts, &PAD_BODY, &mut self.pinned);
+                    let hovered = diagram(ui, PAD_UNITS, 26.0, &parts, &PAD_BODY, &mut self.pinned);
                     if b.has_controller() || stats.total.has_controller() {
                         self.detail(ui, &parts, hovered, "Hover or click a button for its count");
                     } else {
@@ -120,12 +115,9 @@ impl Buttons {
     }
 
     fn range_picker(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            for p in Period::ALL {
-                ui.selectable_value(&mut self.range, Some(p), p.label());
-            }
-            ui.selectable_value(&mut self.range, None, "All time");
-        });
+        let mut options: Vec<_> = Period::ALL.map(|p| (Some(p), p.label())).into();
+        options.push((None, "All time"));
+        segmented(ui, &mut self.range, &options);
     }
 
     fn detail(&self, ui: &mut egui::Ui, parts: &[Part], hovered: Option<usize>, hint: &str) {
