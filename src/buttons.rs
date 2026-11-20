@@ -573,7 +573,7 @@ fn controller(b: Bucket) -> Vec<Part> {
         part(
             rect(8.0, 7.5, 9.0, 8.5),
             arm,
-            "",
+            "→",
             "D-pad right",
             b.pad_right,
         ),
