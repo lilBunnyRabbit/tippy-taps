@@ -48,8 +48,21 @@ bucket!(
     keys, clicks, scrolls, buttons, lt_pulls, rt_pulls, lt_ms, rt_ms, //
     m_left, m_right, m_middle, m_x1, m_x2, //
     pad_a, pad_b, pad_x, pad_y, pad_up, pad_down, pad_left, pad_right, //
-    pad_lb, pad_rb, pad_start, pad_back, pad_ls, pad_rs,
+    pad_lb, pad_rb, pad_start, pad_back, pad_ls, pad_rs, //
+    m_px, m_um, m_dir_n, m_dir_ne, m_dir_e, m_dir_se, m_dir_s, m_dir_sw, m_dir_w, m_dir_nw,
 );
+
+/// Movement per compass sector, clockwise from screen up, in the order `Bucket::directions` uses.
+pub const DIRECTIONS: [Field; 8] = [
+    Field::m_dir_n,
+    Field::m_dir_ne,
+    Field::m_dir_e,
+    Field::m_dir_se,
+    Field::m_dir_s,
+    Field::m_dir_sw,
+    Field::m_dir_w,
+    Field::m_dir_nw,
+];
 
 impl Bucket {
     /// Every counted input. Engaged trigger time is a duration, not an input, and the per-button
@@ -68,6 +81,13 @@ impl Bucket {
 
     pub fn mouse_buttons(&self) -> u64 {
         self.m_left + self.m_right + self.m_middle + self.m_x1 + self.m_x2
+    }
+
+    /// Pixels moved per sector: N, NE, E, SE, S, SW, W, NW.
+    #[allow(dead_code, reason = "read by the Mouse tab")]
+    pub fn directions(&self) -> [u64; 8] {
+        let fields = self.to_array();
+        DIRECTIONS.map(|f| fields[f as usize])
     }
 }
 
@@ -113,7 +133,16 @@ pub fn take() -> Bucket {
 }
 
 pub fn scroll_distance(notches: u64) -> String {
-    let metres = notches as f64 * MM_PER_NOTCH / 1000.0;
+    metres(notches as f64 * MM_PER_NOTCH / 1000.0)
+}
+
+/// `m_um` as on-screen distance, in the same units as `scroll_distance`.
+#[allow(dead_code, reason = "read by the Mouse tab")]
+pub fn move_distance(um: u64) -> String {
+    metres(um as f64 / 1_000_000.0)
+}
+
+fn metres(metres: f64) -> String {
     if metres < 999.95 {
         format!("≈ {metres:.1} m")
     } else {
@@ -293,6 +322,21 @@ mod tests {
         assert_eq!(scroll_distance(100), "≈ 1.3 m");
         assert_eq!(scroll_distance(78_740), "≈ 1.00 km");
         assert_eq!(scroll_distance(100_000), "≈ 1.27 km");
+        assert_eq!(move_distance(0), "≈ 0.0 m");
+        assert_eq!(move_distance(2_400_000_000), "≈ 2.40 km");
+        assert_eq!(move_distance(12_340_000), "≈ 12.3 m");
+    }
+
+    #[test]
+    fn directions_follow_their_fields() {
+        let b = Bucket {
+            m_dir_n: 1,
+            m_dir_e: 3,
+            m_dir_nw: 8,
+            ..Default::default()
+        };
+        assert_eq!(b.directions(), [1, 0, 3, 0, 0, 0, 0, 8]);
+        assert_eq!(b.total(), 0, "movement is not an input count");
     }
 
     #[test]

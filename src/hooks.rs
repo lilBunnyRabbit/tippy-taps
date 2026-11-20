@@ -7,12 +7,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetMessageW, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_EXTENDED,
     LLKHF_INJECTED, LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, SetWindowsHookExW, TranslateMessage,
     WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_MBUTTONDOWN,
-    WM_MOUSEHWHEEL, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN,
-    XBUTTON2,
+    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WM_XBUTTONDOWN, XBUTTON2,
 };
 
 use crate::counts::{self, Field, HeldKeys};
-use crate::keyboard;
+use crate::{keyboard, mouse};
 
 static HELD: HeldKeys = counts::held_keys();
 static ERROR: OnceLock<String> = OnceLock::new();
@@ -99,7 +99,8 @@ unsafe extern "system" fn mouse(code: i32, wparam: WPARAM, lparam: LPARAM) -> LR
         let message = wparam.0 as u32;
         if matches!(
             message,
-            WM_LBUTTONDOWN
+            WM_MOUSEMOVE
+                | WM_LBUTTONDOWN
                 | WM_RBUTTONDOWN
                 | WM_MBUTTONDOWN
                 | WM_XBUTTONDOWN
@@ -108,11 +109,14 @@ unsafe extern "system" fn mouse(code: i32, wparam: WPARAM, lparam: LPARAM) -> LR
         ) {
             let info = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
             if info.flags & LLMHF_INJECTED == 0 {
-                if matches!(message, WM_MOUSEWHEEL | WM_MOUSEHWHEEL) {
+                if message == WM_MOUSEMOVE {
+                    mouse::moved(info.pt.x, info.pt.y);
+                } else if matches!(message, WM_MOUSEWHEEL | WM_MOUSEHWHEEL) {
                     let delta = (info.mouseData >> 16) as u16 as i16;
                     counts::add(Field::scrolls, counts::notches(delta));
                 } else if let Some(field) = click_field(message, info.mouseData) {
                     counts::add(field, 1);
+                    mouse::clicked(info.pt.x, info.pt.y);
                 }
             }
         }

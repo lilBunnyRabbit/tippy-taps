@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::clock::{self, Date, Hour, LocalTime, Month};
 use crate::counts::{self, Bucket};
-use crate::keyboard;
+use crate::{keyboard, mouse};
 
 pub const DIR_NAME: &str = "counts";
 const VERSION: u32 = 2;
@@ -216,6 +216,7 @@ pub fn flush(hour: Hour) {
     let mut storage = storage.lock().unwrap_or_else(|p| p.into_inner());
     storage.flush(hour, counts::take(), &LocalTime::now().stamp());
     keyboard::flush();
+    mouse::flush();
 }
 
 /// Flushes on its own thread, not from egui: a hidden window may stop updating.
@@ -274,9 +275,18 @@ pub fn read_json<T: DeserializeOwned, U>(
 /// Writes to a temp file first, then renames it over the old one, so a crash mid-write
 /// leaves the previous file intact.
 pub fn write_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
+    write_atomic(path, &serde_json::to_vec_pretty(value)?)
+}
+
+/// For large dense arrays, which pretty printing would spread one number per line.
+pub fn write_json_compact<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
+    write_atomic(path, &serde_json::to_vec(value)?)
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = path.with_extension("json.tmp");
     let mut file = std::fs::File::create(&tmp)?;
-    serde_json::to_writer_pretty(&mut file, value)?;
+    file.write_all(bytes)?;
     file.write_all(b"\n")?;
     file.sync_all()?;
     drop(file);
@@ -474,6 +484,36 @@ mod tests {
         assert_eq!(saved[&hour(2026, 11, 20, 8)], expected);
         assert_eq!(storage.total, expected);
         assert_eq!(Storage::open(dir.0.clone(), "x").total, expected);
+    }
+
+    #[test]
+    fn v0_1_shard_loads_with_movement_zero() {
+        let dir = TempDir::new("v01");
+        std::fs::write(
+            dir.0.join("2026-11.json"),
+            r#"{ "version": 2, "hours": { "2026-11-20T08": { "keys": 4, "clicks": 1, "m_left": 1 } } }"#,
+        )
+        .unwrap();
+        let mut storage = Storage::open(dir.0.clone(), "x");
+        assert!(storage.notice.is_none());
+        let b = storage.total;
+        assert_eq!((b.keys, b.m_left, b.m_px, b.m_um), (4, 1, 0, 0));
+        assert_eq!(b.directions(), [0; 8]);
+
+        let moved = Bucket {
+            m_px: 30,
+            m_um: 7_900,
+            m_dir_e: 30,
+            ..Default::default()
+        };
+        storage.flush(hour(2026, 11, 20, 8), moved, "x");
+        let text = std::fs::read_to_string(dir.0.join("2026-11.json")).unwrap();
+        assert!(!text.contains("m_dir_w"), "zero fields are omitted");
+        let saved = Storage::open(dir.0.clone(), "x").total;
+        assert_eq!(
+            (saved.keys, saved.m_px, saved.m_um, saved.m_dir_e),
+            (4, 30, 7_900, 30)
+        );
     }
 
     #[test]

@@ -10,6 +10,7 @@ mod hooks;
 mod keyboard;
 mod layout;
 mod milestones;
+mod mouse;
 mod overlay;
 mod settings;
 mod stats;
@@ -45,6 +46,8 @@ fn main() -> eframe::Result {
     settings::init(&dir);
     overlay::sync();
     keyboard::init(&dir.join(storage::DIR_NAME));
+    mouse::init(&dir.join(storage::DIR_NAME));
+    mouse::spawn();
     autostart::init(first_run);
     hooks::spawn();
     controller::spawn();
