@@ -130,3 +130,38 @@ First-release additions (t4: storage v2, controller, stats window, milestones, f
 - Controller counting takes a backend-neutral snapshot (buttons bitmask in XInput's layout, triggers 0..1). Tests feed fake states for button transitions, trigger pulls at the threshold, the engaged-ms accumulator and the poll schedule (connected slots only, probes on device change and every 10 s).
 - Tests cover period bounds (Monday weeks, month and year wraps), heatmap bucketing and milestone crossing.
 - The report lists idle CPU and working set, hidden and visible, and what was checked by hand in the window.
+
+## v0.2.0 (owner, 2026-11-20)
+
+One release: mouse movement tracking and a Stats tab. Storage stays version 2: new bucket fields are additive (`#[serde(default)]`, zeros omitted), so v0.1 files load as is. Never rename or drop an existing field.
+
+### Mouse movement (task t10, data layer)
+
+Hook cost stays inside the performance budget. On `WM_MOUSEMOVE` (not injected) the callback does integer math and atomic adds only: no `atan2`, no allocation, no locks, no syscalls (`MonitorFromPoint` included).
+
+- **Distance:** delta from the previous point (kept in a hook-thread-only static). Ignore the first event after start, after resume from sleep and after a display change, and drop single jumps larger than the virtual desktop diagonal (warps), so teleports do not count. Store physical pixels per hourly bucket as `m_px`.
+- **Direction:** 8 compass sectors (N, NE, E, SE, S, SW, W, NW; screen up = N), picked by slope comparison. Store the pixel distance per sector per hourly bucket as `m_dir_n` … `m_dir_nw`, so the rose works for every period.
+- **Screen position heatmap, multi-monitor:** all-time, per monitor. Each monitor gets a grid of cells sized to its aspect ratio (about 48 columns on the long side). Two layers per cell: movement distance (px moved while in that cell) and clicks (button presses in that cell).
+  - The hook finds the monitor by testing the point against a cached table of monitor rects (max 8 monitors; points outside every rect are skipped), then does one atomic add into that monitor's fixed cell array. The table is rebuilt off the hook path on `WM_DISPLAYCHANGE` (message-only window) and at start.
+  - Monitor identity must be stable across reboots and re-plugs: use the monitor's device interface path (`EnumDisplayDevicesW` with `EDD_GET_DEVICE_INTERFACE_NAME`), falling back to device name + resolution. A changed resolution on the same monitor keeps its grid (cells are relative).
+  - Persist in `mouse.json` beside `keys.json` (atomic write, flushed only when dirty, same corrupt/locked rules): per monitor id its last-known rect (for drawing the arrangement), friendly name if available, and both cell arrays.
+- **Metres:** convert px to on-screen distance with each monitor's DPI (cached in the same table, `GetDpiForMonitor` effective DPI; 96 DPI fallback). Because the bucket stores px, store the conversion as `m_um` (micrometres moved) alongside `m_px`, computed in the hook with the cached per-monitor µm-per-px integer. Display it like scroll km ("≈ 2.4 km moved").
+- Expose to the UI: per-period distance and the 8-sector totals through the existing aggregates, and a read-only snapshot of the per-monitor grids + rects.
+- Tests: sector picking (all 8 + axis edges), warp/first-event rejection, cell index from point per monitor incl. negative virtual-desktop coordinates (monitor left of or above the primary), unknown-point skip, mouse.json round trip + corrupt handling, v0.1 shard loads with the new fields zero.
+- Measure: CPU of the process while moving the mouse continuously for 30 s with a 1000 Hz mouse if available (before vs after), plus idle hidden CPU (must stay ~0).
+
+### Charts (task t11, designer)
+
+- **Mouse tab:** distance stat per period; direction rose (8 wedges, length or tint = distance; period follows the tab's period picker); screen position heatmap drawing every known monitor in its real arrangement (current layout, disconnected ones greyed or listed), layer toggle Movement / Clicks, hover shows a cell's numbers. Fits the existing heatmap palette and the rabbit theme.
+- **Stats tab (new):** built from existing data only.
+  - Trend: daily totals for 30 / 90 / 365 days, stacked keys / clicks / scrolls, with a 7-day average line.
+  - Records: busiest hour, day, week ever, with date.
+  - Streaks: current and longest run of active days.
+  - Active time: hours with any input per day.
+  - Day shape: first and last active hour per day as a range chart.
+  - Weekday averages Mon…Sun.
+  - Keys per click ratio.
+  - Keyboard heatmap users only: backspace rate (backspace ÷ all keys), left vs right hand split by key position, top 10 keys.
+- Window perf rules still apply: aggregates computed on data change, not per frame.
+
+Done when: `cargo build --release --locked`, `cargo clippy -- -D warnings`, tests pass; README updated (Mouse/Stats tabs, privacy line mentions cursor position heatmap is counts per screen area, never a path or timeline); report lists idle and moving CPU and working set.
