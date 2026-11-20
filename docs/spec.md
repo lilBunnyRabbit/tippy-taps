@@ -69,6 +69,7 @@ Requester asks for: hour/day/week/month counters, time-of-day stats, a gross tot
 - Year calendar heatmap: one cell per day, GitHub-style, for the last 53 weeks.
 - Hovering or clicking a heatmap cell shows that cell's breakdown.
 - Controller section (shown once any controller data exists): buttons, LT/RT pulls, LT/RT engaged time.
+- Scroll distance fun stat: notches converted to the distance scrolled on screen, at 3 lines per notch × ~4.23 mm per line (16 px at 96 DPI) = 12.7 mm per notch. Show it as m or km next to scrolls for every period and all-time ("≈ 1.27 km scrolled"). It's derived at display time and not stored.
 - Gross total: all-time sum of every count, hidden behind a "tap to reveal" control and hidden again on close.
 
 **Milestones + fireworks** (opt-in, off by default, toggled in the window and the tray menu)
