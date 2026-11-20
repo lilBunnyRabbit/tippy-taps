@@ -87,17 +87,13 @@ impl Storage {
             self.dirty.insert(hour.date.month());
             REVISION.fetch_add(1, Ordering::Relaxed);
         }
-        if self.dirty.is_empty() {
-            return;
-        }
         if !self.listed {
             self.load_all(stamp);
         }
-        let retry: Vec<Month> = self.blocked.intersection(&self.dirty).copied().collect();
-        for month in retry {
+        for month in self.blocked.clone() {
             self.load_shard(month, stamp);
         }
-        if !self.listed {
+        if self.dirty.is_empty() || !self.listed {
             return;
         }
         let mut failed = None;
@@ -512,6 +508,26 @@ mod tests {
         assert_eq!(saved[&hour(2026, 11, 19, 0)], keys(9, 0));
         assert_eq!(saved[&hour(2026, 11, 20, 9)], keys(15, 1));
         assert_eq!(storage.total, keys(25, 1));
+    }
+
+    #[test]
+    fn blocked_past_month_is_retried_without_new_counts() {
+        let dir = TempDir::new("retry-past");
+        let october = dir.0.join("2026-10.json");
+        std::fs::create_dir(&october).unwrap();
+        let mut storage = Storage::open(dir.0.clone(), "s");
+        assert!(storage.saving_blocked());
+
+        std::fs::remove_dir(&october).unwrap();
+        std::fs::write(
+            &october,
+            r#"{ "version": 2, "hours": { "2026-10-05T09": { "keys": 4 } } }"#,
+        )
+        .unwrap();
+        storage.flush(hour(2026, 11, 20, 9), Bucket::default(), "s");
+        assert!(!storage.saving_blocked());
+        assert!(storage.error.is_none());
+        assert_eq!(storage.total, keys(4, 0));
     }
 
     #[test]

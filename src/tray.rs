@@ -218,7 +218,7 @@ pub fn tooltip(c: Bucket, saving_blocked: bool) -> String {
     if saving_blocked {
         text.push_str(
             "
-Not saving: can't open counts.json, retrying",
+Not saving: can't open the saved counts, retrying",
         );
     }
     text
@@ -326,7 +326,7 @@ mod tests {
         assert_eq!(
             tooltip(c, true),
             "Today: 12,345 keys · 678 clicks · 90 scrolls
-Not saving: can't open counts.json, retrying"
+Not saving: can't open the saved counts, retrying"
         );
         assert!(tooltip(c, true).encode_utf16().count() < 128);
     }

@@ -211,7 +211,12 @@ impl App {
         weak(ui, format!("{} scrolled", scroll_distance(current.scrolls)));
         weak(
             ui,
-            format!("{}: {}", self.period.previous_label(), breakdown(previous)),
+            format!(
+                "{}: {} · {} scrolled",
+                self.period.previous_label(),
+                breakdown(previous),
+                scroll_distance(previous.scrolls)
+            ),
         );
         ui.add_space(12.0);
 

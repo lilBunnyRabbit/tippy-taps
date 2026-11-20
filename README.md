@@ -24,7 +24,7 @@ What counts:
 
 Input sent by other programs (macros, remote tools, on-screen keyboards) is not counted.
 
-**Privacy:** tippy-taps counts only. It never stores or logs which keys you press. The counts live in `%APPDATA%\tippy-taps\counts.json` and never leave your PC.
+**Privacy:** tippy-taps counts only. It never stores or logs which keys you press. The counts live in `%APPDATA%\tippy-taps\counts\` (one file per month, beside `settings.json`) and never leave your PC.
 
 Counts are saved every 30 seconds and on quit, only when something changed, so a power cut loses at most the last 30 seconds and an idle PC writes nothing.
 
