@@ -79,17 +79,18 @@ pub fn take_queued() -> Vec<Milestone> {
     std::mem::take(&mut *QUEUE.lock().unwrap_or_else(|p| p.into_inner()))
 }
 
-pub fn requeue(shows: Vec<Milestone>) {
-    let mut queue = QUEUE.lock().unwrap_or_else(|p| p.into_inner());
-    queue.splice(0..0, shows);
+fn enqueue(queue: &mut Vec<Milestone>, shows: Vec<Milestone>) {
+    queue.extend(shows);
     let excess = queue.len().saturating_sub(QUEUE_MAX);
     queue.drain(..excess);
 }
 
 /// Records newly reached milestones and queues fireworks for them when they are on. The first
 /// check of a session only records: anything reached then was crossed before we were watching
-/// (or while settings.json was missing). Returns true when fireworks were queued.
-pub fn check(total: Bucket) -> bool {
+/// (or while settings.json was missing). Returns true when fireworks are due. `played_now`: a
+/// visible rabbit plays them, so they don't wait for the window; nothing is taken back out of
+/// the queue, so shows queued earlier can't be lost.
+pub fn check(total: Bucket, played_now: bool) -> bool {
     let new = settings::read(|s| new_milestones(total, &s.celebrated));
     if new.is_empty() {
         BASELINED.store(true, Ordering::Relaxed);
@@ -99,16 +100,18 @@ pub fn check(total: Bucket) -> bool {
     if !BASELINED.swap(true, Ordering::Relaxed) || !settings::fireworks() {
         return false;
     }
-    let mut queue = QUEUE.lock().unwrap_or_else(|p| p.into_inner());
-    queue.extend(to_celebrate(&new));
-    let excess = queue.len().saturating_sub(QUEUE_MAX);
-    queue.drain(..excess);
+    if !played_now {
+        enqueue(
+            &mut QUEUE.lock().unwrap_or_else(|p| p.into_inner()),
+            to_celebrate(&new),
+        );
+    }
     true
 }
 
 /// Totals are only complete once every shard has loaded; until then a check would celebrate
 /// counts that merely reappeared.
-pub fn check_storage(pending: Bucket) -> bool {
+pub fn check_storage(pending: Bucket, played_now: bool) -> bool {
     let total = {
         let storage = storage::get();
         if storage.saving_blocked() {
@@ -118,7 +121,7 @@ pub fn check_storage(pending: Bucket) -> bool {
         total += pending;
         total
     };
-    check(total)
+    check(total, played_now)
 }
 
 #[cfg(test)]
@@ -126,16 +129,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn requeued_shows_go_first_and_the_queue_stays_capped() {
+    fn the_queue_drops_its_oldest_shows_past_the_cap() {
         let show = |value| Milestone {
             count: "keys",
             value,
         };
-        QUEUE.lock().unwrap().extend((1..=QUEUE_MAX as u64).map(|n| show(n * 10)));
-        requeue(vec![show(1), show(2)]);
-        let queue = take_queued();
+        let mut queue = vec![show(1), show(2)];
+        enqueue(
+            &mut queue,
+            (1..=QUEUE_MAX as u64).map(|n| show(n * 10)).collect(),
+        );
         assert_eq!(queue.len(), QUEUE_MAX);
-        assert_eq!(queue[0], show(10), "the oldest are dropped first");
+        assert_eq!(queue[0], show(10));
         assert_eq!(queue.last(), Some(&show(QUEUE_MAX as u64 * 10)));
     }
 

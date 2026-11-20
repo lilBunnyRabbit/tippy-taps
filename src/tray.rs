@@ -268,22 +268,8 @@ fn refresh() {
         let seen = (storage::revision(), clock::now_hour(), counts::pending());
         if tray.seen != Some(seen) {
             tray.seen = Some(seen);
-            // Shows the rabbit plays now don't wait for the window; ones queued while nothing
-            // was visible still do.
             let rabbit_only = overlay::visible() && !ui::shown();
-            let earlier = if rabbit_only {
-                milestones::take_queued()
-            } else {
-                Vec::new()
-            };
-            let fired = milestones::check_storage(seen.2);
-            if rabbit_only {
-                milestones::take_queued();
-                if !earlier.is_empty() {
-                    milestones::requeue(earlier);
-                }
-            }
-            if fired {
+            if milestones::check_storage(seen.2, rabbit_only) {
                 if overlay::visible() {
                     overlay::cheer();
                 }
