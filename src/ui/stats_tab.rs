@@ -295,8 +295,11 @@ fn records(ui: &mut egui::Ui, stats: &Stats) {
             &mut cols[1],
             days(s.longest),
             "longest streak",
-            s.longest_end
-                .map_or_else(String::new, |d| format!("ended {}", short_date(d))),
+            match s.longest_end {
+                _ if s.longest > 0 && s.current == s.longest => "still going".into(),
+                Some(d) => format!("ended {}", short_date(d)),
+                None => String::new(),
+            },
         );
         let ratio = if stats.total.clicks == 0 {
             "–".into()
@@ -308,6 +311,16 @@ fn records(ui: &mut egui::Ui, stats: &Stats) {
 }
 
 fn keyboard(ui: &mut egui::Ui, k: &KeyView) {
+    if k.insights.total == 0 {
+        card(ui, |ui| {
+            caption(ui, "KEYBOARD");
+            weak(
+                ui,
+                "No key presses counted yet. They fill in as you type.".into(),
+            );
+        });
+        return;
+    }
     ui.columns(2, |cols| {
         card(&mut cols[0], |ui| {
             ui.set_min_height(PANEL_HEIGHT * 2.0);

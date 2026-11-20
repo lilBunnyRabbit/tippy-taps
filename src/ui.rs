@@ -97,18 +97,23 @@ pub fn shown() -> bool {
 }
 
 /// Storage, hour, pending taps without movement, keyboard, and the mouse grids with pending
-/// movement. Movement streams in while the cursor moves, so it only counts while the Mouse tab is
-/// on screen and never recomputes the other tabs' aggregates.
-pub(crate) type Fingerprint = (u64, Hour, Bucket, u64, (u64, Bucket));
+/// clicks and movement. Movement streams in while the cursor moves, so it only counts while the
+/// Mouse tab is on screen and never recomputes the other tabs' aggregates.
+pub(crate) type Fingerprint = (u64, Hour, Bucket, u64, MouseKey);
+type MouseKey = (u64, u64, Bucket);
+
+fn mouse_hidden() -> MouseKey {
+    (0, 0, Bucket::default())
+}
 
 static MOUSE_SHOWN: AtomicBool = AtomicBool::new(false);
 
 fn fingerprint() -> Fingerprint {
     let (taps, moved) = split_movement(counts::pending());
     let mouse = if MOUSE_SHOWN.load(Ordering::Relaxed) {
-        (mouse::revision(), moved)
+        (mouse::revision(), taps.clicks, moved)
     } else {
-        (0, Bucket::default())
+        mouse_hidden()
     };
     (
         storage::revision(),
@@ -365,7 +370,7 @@ impl App {
                 view
             }
             Some(mut view) if same_taps(&view.key, &key) => {
-                if key.4 != view.key.4 && key.4 != (0, Bucket::default()) {
+                if key.4 != view.key.4 && key.4 != mouse_hidden() {
                     view.screens = mouse_tab::Screens::new(mouse::snapshot());
                 }
                 view.key = key;
@@ -393,7 +398,7 @@ impl App {
                 };
                 let key_view = kept_keys.or_else(|| keyboard::enabled().then(|| key_view(&keys)));
                 let screens = screens.unwrap_or_else(|| {
-                    mouse_tab::Screens::new(if key.4 == (0, Bucket::default()) {
+                    mouse_tab::Screens::new(if key.4 == mouse_hidden() {
                         Vec::new()
                     } else {
                         mouse::snapshot()
@@ -682,7 +687,7 @@ impl App {
             }
             None => (view.stats.total, None),
         };
-        current += view.key.4.1;
+        current += view.key.4.2;
         ui.columns(3, |cols| {
             card(&mut cols[0], |ui| {
                 ui.set_min_height(MOUSE_CARD_HEIGHT);

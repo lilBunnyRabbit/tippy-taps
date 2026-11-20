@@ -229,18 +229,23 @@ fn streaks(days: &[Day], today: Date) -> Streaks {
     s
 }
 
+/// Today is still running, so only finished days count.
 fn weekdays(days: &[Day], today: Date) -> [[f32; 3]; 7] {
-    let Some(first) = days.iter().find(|d| d.bucket.total() > 0).map(|d| d.date) else {
+    let Some(first) = days
+        .iter()
+        .find(|d| d.bucket.total() > 0 && d.date < today)
+        .map(|d| d.date)
+    else {
         return [[0.0; 3]; 7];
     };
     let mut sums = [[0u64; 3]; 7];
-    for d in days.iter().filter(|d| d.date >= first) {
+    for d in days.iter().filter(|d| d.date >= first && d.date < today) {
         let w = d.date.weekday();
         sums[w][0] += d.bucket.keys;
         sums[w][1] += d.bucket.clicks;
         sums[w][2] += d.bucket.scrolls;
     }
-    let span = today.to_days() - first.to_days() + 1;
+    let span = today.to_days() - first.to_days();
     std::array::from_fn(|w| {
         let offset = (w as i64 - first.weekday() as i64).rem_euclid(7);
         let count = (span - offset + 6).div_euclid(7).max(1) as f32;
@@ -308,17 +313,24 @@ pub fn compute(hours: &Hours, total: Bucket, pending: Bucket, now: Hour) -> Stat
             row[at.hour as usize] += b.total();
         }
     }
-    let typical =
-        RANGES.map(|r| typical(&masks[(shape_today + 1).saturating_sub(r)..=shape_today]));
-    let mut avg7 = Vec::with_capacity(days.len());
-    let mut window = 0u64;
-    for (i, d) in days.iter().enumerate() {
-        window += kcs(d);
-        if i >= 7 {
-            window -= kcs(&days[i - 7]);
-        }
-        avg7.push(window as f32 / (i + 1).min(7) as f32);
-    }
+    // The running day would pull the usual end towards now, so the ranges end yesterday.
+    let typical = RANGES.map(|r| typical(&masks[shape_today.saturating_sub(r)..shape_today]));
+    let before: Vec<u64> = (1..7)
+        .rev()
+        .map(|d| {
+            let day = calendar_start.minus_days(d);
+            kcs(&sum(
+                hours,
+                Hour::start_of(day),
+                Hour::start_of(day.plus_days(1)),
+            ))
+        })
+        .collect();
+    let totals: Vec<u64> = before.iter().copied().chain(days.iter().map(kcs)).collect();
+    let avg7 = totals
+        .windows(7)
+        .map(|w| w.iter().sum::<u64>() as f32 / 7.0)
+        .collect();
 
     let mut total = total;
     total += pending;
@@ -571,6 +583,7 @@ mod tests {
         let mut hours = Hours::new();
         hours.insert(at(date(2026, 11, 13), 9), keys(70));
         let s = compute(&hours, Bucket::default(), Bucket::default(), now);
+        assert_eq!(s.avg7.len(), s.days.len());
         let day = |d: Date| (d.to_days() - s.calendar_start.to_days()) as usize;
         assert_eq!(s.avg7[day(date(2026, 11, 13))], 10.0);
         assert_eq!(s.avg7[day(date(2026, 11, 19))], 10.0);
@@ -601,14 +614,64 @@ mod tests {
         assert_eq!(today[(26 - DAY_START) as usize], 6, "pending at 02:00");
         assert_eq!(s.recent[RECENT_DAYS - 2][(20 - DAY_START) as usize], 5);
         let t = s.typical[0];
+        assert_eq!(
+            t.active_days, 1,
+            "the running day (the 19th until 04:00) is left out"
+        );
+        assert_eq!(t.share[(9 - DAY_START) as usize], 0.0);
+        assert_eq!(t.share[(10 - DAY_START) as usize], 1.0);
+        assert_eq!(t.usual, Some((6, 17)));
+        assert_eq!(t.mean_hours, 2.0);
+    }
+
+    #[test]
+    fn typical_day_medians_pick_the_upper_middle() {
+        let now = at(date(2026, 11, 20), 12);
+        let mut hours = Hours::new();
+        hours.insert(at(date(2026, 11, 18), 9), keys(1));
+        hours.insert(at(date(2026, 11, 18), 21), keys(1));
+        hours.insert(at(date(2026, 11, 19), 10), keys(1));
+        hours.insert(at(date(2026, 11, 20), 1), keys(1));
+        hours.insert(at(date(2026, 11, 20), 6), keys(1));
+        let s = compute(&hours, Bucket::default(), Bucket::default(), now);
+        let t = s.typical[0];
         assert_eq!(t.active_days, 2);
         assert_eq!(t.share[(9 - DAY_START) as usize], 0.5);
         assert_eq!(
             t.usual,
-            Some((6, 23)),
-            "medians of 5,6 and 17,23 pick the upper"
+            Some((6, 22)),
+            "starts 5,6 and ends 18,22 pick the upper"
         );
-        assert_eq!(t.mean_hours, 3.0);
+        assert_eq!(t.mean_hours, 2.0);
+    }
+
+    #[test]
+    fn todays_partial_day_stays_out_of_weekday_averages() {
+        let now = at(date(2026, 11, 20), 8);
+        let mut hours = Hours::new();
+        hours.insert(at(date(2026, 11, 6), 9), keys(30));
+        hours.insert(at(date(2026, 11, 13), 9), keys(30));
+        let s = compute(&hours, Bucket::default(), keys(1), now);
+        assert_eq!(
+            s.weekdays[4],
+            [30.0, 0.0, 0.0],
+            "two finished Fridays, not three"
+        );
+        let fresh = compute(&Hours::new(), Bucket::default(), keys(5), now);
+        assert_eq!(fresh.weekdays, [[0.0; 3]; 7], "only today so far");
+    }
+
+    #[test]
+    fn seven_day_average_reaches_before_the_calendar() {
+        let now = at(date(2026, 11, 16), 14);
+        let mut hours = Hours::new();
+        let start = date(2026, 11, 16).minus_days(52 * 7);
+        hours.insert(at(start.minus_days(3), 9), keys(70));
+        let s = compute(&hours, Bucket::default(), Bucket::default(), now);
+        assert_eq!(s.calendar_start, start);
+        assert_eq!(s.avg7[0], 10.0);
+        assert_eq!(s.avg7[3], 10.0);
+        assert_eq!(s.avg7[4], 0.0);
     }
 
     #[test]
