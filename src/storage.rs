@@ -381,8 +381,8 @@ fn split_month(dir: &Path, month: Month, stamp: &str, moved: &mut Vec<PathBuf>) 
         return remove_if_exists(&journal);
     }
     let resumed = load_shard(&journal, month, stamp)?;
-    let damaged = resumed.moved_to.is_some();
     moved.extend(resumed.moved_to);
+    let damaged = damaged_journals(dir, month)?;
     let plan = match resumed.value {
         Some(plan) => plan,
         None => {
@@ -397,7 +397,8 @@ fn split_month(dir: &Path, month: Month, stamp: &str, moved: &mut Vec<PathBuf>) 
                 let existing = read_day(dir, date, stamp)?;
                 moved.extend(existing.moved_to);
                 let existing = existing.value.unwrap_or_default();
-                let written = damaged && holds(&existing, &day_hours(&from_month, date));
+                let written =
+                    !damaged.is_empty() && holds(&existing, &day_hours(&from_month, date));
                 for (hour, bucket) in day_hours(&from_month, date) {
                     if !written {
                         *plan.entry(hour).or_default() += bucket;
@@ -432,7 +433,29 @@ fn split_month(dir: &Path, month: Month, stamp: &str, moved: &mut Vec<PathBuf>) 
         }
     }
     std::fs::rename(&shard, free_backup(dir, month, stamp))?;
-    remove_if_exists(&journal)
+    remove_if_exists(&journal)?;
+    for path in damaged {
+        std::fs::rename(&path, path.with_extension("json.recovered"))?;
+    }
+    Ok(())
+}
+
+/// A damaged journal stays on disk until its month is split, so a re-plan that fails before
+/// its own journal is saved still knows, on the next try, that some days hold the old plan.
+fn damaged_journals(dir: &Path, month: Month) -> io::Result<Vec<PathBuf>> {
+    let prefix = format!("{month}{SPLIT_SUFFIX}.corrupt-");
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name
+            .to_str()
+            .is_some_and(|n| n.starts_with(&prefix) && n.ends_with(".json"))
+        {
+            found.push(entry.path());
+        }
+    }
+    Ok(found)
 }
 
 fn holds(file: &Hours, from_month: &Hours) -> bool {
@@ -1143,7 +1166,6 @@ mod tests {
                 .unwrap()
                 .contains("2026-11.split.corrupt-x.json")
         );
-        assert!(dir.0.join("2026-11.split.corrupt-x.json").exists());
         assert_eq!(
             saved(&dir.day(11, 10))[&hour(2026, 11, 10, 8)],
             keys(3, 0),
@@ -1154,6 +1176,38 @@ mod tests {
 
         storage.flush(hour(2026, 11, 20, 9), keys(10, 0), "x");
         assert_eq!(open(&dir).total, storage.total);
+        assert!(
+            dir.0
+                .join("2026-11.split.corrupt-x.json.recovered")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn failed_replan_after_a_damaged_journal_still_skips_written_days() {
+        let dir = TempDir::new("split-bad-journal-twice");
+        std::fs::write(dir.0.join("2026-11.json"), NOV_SHARD).unwrap();
+        dir.write_day(
+            11,
+            10,
+            r#"{"version":2,"hours":{"2026-11-10T08":{"keys":3}}}"#,
+        );
+        std::fs::write(dir.0.join("2026-11.split.json"), "{ torn").unwrap();
+        let locked = dir.day(11, 15);
+        std::fs::create_dir_all(&locked).unwrap();
+
+        let failed = open(&dir);
+        assert!(!failed.complete());
+        assert!(
+            !dir.0.join("2026-11.split.json").exists(),
+            "no new journal yet"
+        );
+
+        std::fs::remove_dir(&locked).unwrap();
+        let storage = open(&dir);
+        assert!(storage.complete());
+        assert_eq!(saved(&dir.day(11, 10))[&hour(2026, 11, 10, 8)], keys(3, 0));
+        assert_eq!(storage.total.keys, 3 + 5 + 2);
     }
 
     #[test]
