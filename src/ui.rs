@@ -16,7 +16,15 @@ use crate::clock::{self, Date, Hour};
 use crate::counts::{self, Bucket, duration, group, scroll_distance};
 use crate::fireworks::Fireworks;
 use crate::stats::{self, CALENDAR_WEEKS, Period, Stats};
-use crate::{autostart, hooks, keyboard, milestones, overlay, settings, storage, tray};
+mod charts;
+mod mouse_tab;
+
+pub(crate) use charts::compact;
+mod stats_tab;
+
+use crate::{
+    autostart, hooks, keyboard, layout, milestones, mouse, overlay, settings, storage, tray,
+};
 
 pub(crate) const BRAND_DARKER: Color32 = Color32::from_rgb(0x0b, 0x15, 0x19);
 const BRAND_BG: Color32 = Color32::from_rgb(0x17, 0x25, 0x2c);
@@ -29,6 +37,12 @@ const BRAND_PRIMARY_TINT: Color32 = Color32::from_rgb(0x2a, 0x37, 0x31);
 pub(crate) const BRAND_COTTONTAIL: Color32 = Color32::from_rgb(0xe3, 0xf9, 0xb2);
 const BRAND_WARNING: Color32 = Color32::from_rgb(0xe4, 0x9b, 0x39);
 const BRAND_ERROR: Color32 = Color32::from_rgb(0xf8, 0x88, 0x76);
+/// Keys, clicks, scrolls: one hue each, checked for colour-blind separation on the page shade.
+pub(crate) const SERIES: [Color32; 3] = [
+    Color32::from_rgb(0x84, 0xa0, 0x55),
+    Color32::from_rgb(0x4a, 0x95, 0xcc),
+    Color32::from_rgb(0xcc, 0x80, 0x48),
+];
 /// How often a shown window looks for new taps to drum; data repaints stay at `CHANGE_CHECK`.
 const DRUM_CHECK: Duration = Duration::from_millis(33);
 const CHANGE_CHECK: u32 = 15;
@@ -38,6 +52,7 @@ const PAW_HOLD: f64 = 0.11;
 const PAGE_MARGIN: i8 = 24;
 const RABBIT_SIZE: f32 = 92.0;
 const SIDE_CARD_HEIGHT: f32 = 132.0;
+const MOUSE_CARD_HEIGHT: f32 = 240.0;
 const LABEL_WIDTH: f32 = 34.0;
 const LABEL_HEIGHT: f32 = 16.0;
 const GAP: f32 = 3.0;
@@ -81,15 +96,48 @@ pub fn shown() -> bool {
     SHOWN.load(Ordering::Relaxed)
 }
 
-pub(crate) type Fingerprint = (u64, Hour, Bucket, u64);
+/// Storage, hour, pending taps without movement, keyboard, and the mouse grids with pending
+/// movement. Movement streams in while the cursor moves, so it only counts while the Mouse tab is
+/// on screen and never recomputes the other tabs' aggregates.
+pub(crate) type Fingerprint = (u64, Hour, Bucket, u64, (u64, Bucket));
+
+static MOUSE_SHOWN: AtomicBool = AtomicBool::new(false);
 
 fn fingerprint() -> Fingerprint {
+    let (taps, moved) = split_movement(counts::pending());
+    let mouse = if MOUSE_SHOWN.load(Ordering::Relaxed) {
+        (mouse::revision(), moved)
+    } else {
+        (0, Bucket::default())
+    };
     (
         storage::revision(),
         clock::now_hour(),
-        counts::pending(),
+        taps,
         keyboard::revision(),
+        mouse,
     )
+}
+
+fn same_taps(a: &Fingerprint, b: &Fingerprint) -> bool {
+    (a.0, a.1, a.2, a.3) == (b.0, b.1, b.2, b.3)
+}
+
+fn split_movement(mut b: Bucket) -> (Bucket, Bucket) {
+    let moved = Bucket {
+        m_px: std::mem::take(&mut b.m_px),
+        m_um: std::mem::take(&mut b.m_um),
+        m_dir_n: std::mem::take(&mut b.m_dir_n),
+        m_dir_ne: std::mem::take(&mut b.m_dir_ne),
+        m_dir_e: std::mem::take(&mut b.m_dir_e),
+        m_dir_se: std::mem::take(&mut b.m_dir_se),
+        m_dir_s: std::mem::take(&mut b.m_dir_s),
+        m_dir_sw: std::mem::take(&mut b.m_dir_sw),
+        m_dir_w: std::mem::take(&mut b.m_dir_w),
+        m_dir_nw: std::mem::take(&mut b.m_dir_nw),
+        ..Default::default()
+    };
+    (b, moved)
 }
 
 /// Which paws the taps between two pending snapshots drum. Mouse buttons keep their side, wheels
@@ -197,15 +245,17 @@ fn trim_working_set() {
 enum Tab {
     Counts,
     When,
+    Stats,
     Keyboard,
     Mouse,
     Controller,
 }
 
 impl Tab {
-    const ALL: [(Self, &'static str); 5] = [
+    const ALL: [(Self, &'static str); 6] = [
         (Self::Counts, "Counts"),
         (Self::When, "When"),
+        (Self::Stats, "Stats"),
         (Self::Keyboard, "Keyboard"),
         (Self::Mouse, "Mouse"),
         (Self::Controller, "Controller"),
@@ -252,6 +302,8 @@ struct View {
     key: Fingerprint,
     stats: Stats,
     keys: Box<keyboard::Counts>,
+    key_view: Option<stats_tab::KeyView>,
+    screens: mouse_tab::Screens,
     computed_at: f64,
 }
 
@@ -261,6 +313,8 @@ pub struct App {
     revealed: bool,
     view: Option<View>,
     buttons: Buttons,
+    stats_tab: stats_tab::StatsTab,
+    mouse_tab: mouse_tab::MouseTab,
     pinned_hour: Option<(usize, usize)>,
     pinned_day: Option<(usize, usize)>,
     fireworks: Fireworks,
@@ -282,6 +336,8 @@ impl App {
             revealed: false,
             view: None,
             buttons: Buttons::new(),
+            stats_tab: stats_tab::StatsTab::new(),
+            mouse_tab: mouse_tab::MouseTab::new(),
             pinned_hour: None,
             pinned_day: None,
             fireworks: Fireworks::new(
@@ -308,7 +364,15 @@ impl App {
                 ctx.request_repaint_after(Duration::from_secs_f64(wait - (now - view.computed_at)));
                 view
             }
-            _ => {
+            Some(mut view) if same_taps(&view.key, &key) => {
+                if key.4 != view.key.4 && key.4 != (0, Bucket::default()) {
+                    view.screens = mouse_tab::Screens::new(mouse::snapshot());
+                }
+                view.key = key;
+                view.computed_at = now;
+                view
+            }
+            old => {
                 let stats = {
                     let storage = storage::get();
                     stats::compute(&storage.hours, storage.total, key.2, key.1)
@@ -318,15 +382,54 @@ impl App {
                 } else {
                     Box::new([0; keyboard::SLOTS])
                 };
+                let (kept_keys, screens) = match old {
+                    Some(old) => (
+                        (old.key.3 == key.3 && old.key_view.is_some() == keyboard::enabled())
+                            .then_some(old.key_view)
+                            .flatten(),
+                        (old.key.4 == key.4).then_some(old.screens),
+                    ),
+                    None => (None, None),
+                };
+                let key_view = kept_keys.or_else(|| keyboard::enabled().then(|| key_view(&keys)));
+                let screens = screens.unwrap_or_else(|| {
+                    mouse_tab::Screens::new(if key.4 == (0, Bucket::default()) {
+                        Vec::new()
+                    } else {
+                        mouse::snapshot()
+                    })
+                });
                 View {
                     key,
                     stats,
                     keys,
+                    key_view,
+                    screens,
                     computed_at: now,
                 }
             }
         }
     }
+}
+
+/// Key names come from the active layout, so they are resolved with the counts, not per frame.
+fn key_view(counts: &keyboard::Counts) -> stats_tab::KeyView {
+    let insights = stats::key_insights(counts);
+    let keys: Vec<_> = insights
+        .top
+        .iter()
+        .map(|(slot, _)| layout::Key {
+            x: 0.0,
+            y: 0.0,
+            w: 1.0,
+            h: 1.0,
+            slot: *slot,
+            alias: None,
+        })
+        .collect();
+    let labels = layout::labels(&keys, layout::Layout::active());
+    let names = layout::names(&keys, &labels);
+    stats_tab::KeyView { insights, names }
 }
 
 fn rabbit_texture(ctx: &egui::Context, name: &str, png: &[u8]) -> TextureHandle {
@@ -359,6 +462,7 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        MOUSE_SHOWN.store(self.tab == Tab::Mouse, Ordering::Relaxed);
         let view = self.take_view(&ctx);
         self.queue_fireworks(&ctx);
         self.header(ui, &view.stats);
@@ -488,13 +592,12 @@ impl App {
         match self.tab {
             Tab::Counts => self.counts(ui, &view.stats),
             Tab::When => self.when(ui, &view.stats),
+            Tab::Stats => self.stats_tab.show(ui, &view.stats, view.key_view.as_ref()),
             Tab::Keyboard => {
                 self.buttons
                     .show(ui, Device::Keyboard, &view.stats, &view.keys, view.key)
             }
-            Tab::Mouse => self
-                .buttons
-                .show(ui, Device::Mouse, &view.stats, &view.keys, view.key),
+            Tab::Mouse => self.mouse(ui, view),
             Tab::Controller => {
                 self.buttons
                     .show(ui, Device::Controller, &view.stats, &view.keys, view.key)
@@ -566,6 +669,37 @@ impl App {
         } else {
             all_time(ui, &mut self.revealed);
         }
+    }
+
+    fn mouse(&mut self, ui: &mut egui::Ui, view: &View) {
+        self.buttons.range_picker(ui);
+        ui.add_space(12.0);
+        let range = self.buttons.range();
+        let (mut current, previous) = match range {
+            Some(p) => {
+                let (c, prev) = view.stats.period(p);
+                (c, Some((prev, p.previous_label())))
+            }
+            None => (view.stats.total, None),
+        };
+        current += view.key.4.1;
+        ui.columns(3, |cols| {
+            card(&mut cols[0], |ui| {
+                ui.set_min_height(MOUSE_CARD_HEIGHT);
+                caption(ui, "BUTTONS");
+                self.buttons.mouse_diagram(ui, current);
+            });
+            card(&mut cols[1], |ui| {
+                ui.set_min_height(MOUSE_CARD_HEIGHT);
+                mouse_tab::MouseTab::distance(ui, current, previous);
+            });
+            card(&mut cols[2], |ui| {
+                ui.set_min_height(MOUSE_CARD_HEIGHT);
+                mouse_tab::MouseTab::direction(ui, current);
+            });
+        });
+        ui.add_space(12.0);
+        self.mouse_tab.screens(ui, &view.screens);
     }
 
     fn when(&mut self, ui: &mut egui::Ui, stats: &Stats) {
@@ -774,6 +908,7 @@ fn footer(ui: &mut egui::Ui) {
         .into_iter()
         .flatten()
         .chain(keyboard::messages())
+        .chain(mouse::messages())
     {
         ui.colored_label(BRAND_WARNING, text);
     }
@@ -1136,6 +1271,30 @@ mod tests {
             totals(b),
             "1,237 inputs: 1,234 keys · 0 clicks · 0 scrolls · 0 buttons · LT 3 · RT 0"
         );
+    }
+
+    #[test]
+    fn movement_splits_off_the_taps() {
+        let b = Bucket {
+            keys: 3,
+            clicks: 2,
+            m_px: 100,
+            m_um: 26_000,
+            m_dir_e: 60,
+            m_dir_sw: 40,
+            ..Default::default()
+        };
+        let (taps, moved) = split_movement(b);
+        assert_eq!(
+            taps,
+            Bucket {
+                keys: 3,
+                clicks: 2,
+                ..Default::default()
+            }
+        );
+        assert_eq!(moved.directions(), [0, 0, 60, 0, 0, 40, 0, 0]);
+        assert_eq!((moved.m_px, moved.m_um, moved.total()), (100, 26_000, 0));
     }
 
     #[test]

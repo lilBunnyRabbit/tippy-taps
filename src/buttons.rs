@@ -10,7 +10,7 @@ use crate::settings;
 use crate::stats::{Period, Stats};
 use crate::ui::{
     BRAND_BG_LIGHT, BRAND_BG_LIGHTEST, BRAND_COTTONTAIL, BRAND_DARKER, BRAND_FG, BRAND_FG_WEAK,
-    Fingerprint, heat, segmented, weak,
+    Fingerprint, compact, heat, segmented, weak,
 };
 
 const KEYS_LINE: &str =
@@ -93,10 +93,7 @@ impl Buttons {
                 };
                 ui.add_space(6.0);
                 if self.device == Device::Mouse {
-                    let parts = mouse(b);
-                    let hovered =
-                        diagram(ui, MOUSE_UNITS, 22.0, &parts, &MOUSE_BODY, &mut self.pinned);
-                    self.detail(ui, &parts, hovered, "Hover or click a button for its count");
+                    self.mouse_diagram(ui, b);
                 } else {
                     let parts = controller(b);
                     let hovered = diagram(ui, PAD_UNITS, 26.0, &parts, &PAD_BODY, &mut self.pinned);
@@ -114,7 +111,22 @@ impl Buttons {
         }
     }
 
-    fn range_picker(&mut self, ui: &mut egui::Ui) {
+    pub fn range(&self) -> Option<Period> {
+        self.range
+    }
+
+    /// The Mouse tab lays the diagram out in a card beside its other charts.
+    pub fn mouse_diagram(&mut self, ui: &mut egui::Ui, b: Bucket) {
+        if self.device != Device::Mouse {
+            self.device = Device::Mouse;
+            self.pinned = None;
+        }
+        let parts = mouse(b);
+        let hovered = diagram(ui, MOUSE_UNITS, 14.0, &parts, &MOUSE_BODY, &mut self.pinned);
+        self.detail(ui, &parts, hovered, "Hover a button for its count");
+    }
+
+    pub fn range_picker(&mut self, ui: &mut egui::Ui) {
         let mut options: Vec<_> = Period::ALL.map(|p| (Some(p), p.label())).into();
         options.push((None, "All time"));
         segmented(ui, &mut self.range, &options);
@@ -454,7 +466,7 @@ const MOUSE_BODY: [(Rect, f32); 1] = [(
 fn mouse(b: Bucket) -> Vec<Part> {
     let (top, edge) = (3.3, 0.2);
     let main = |r, corners, short: &str, name: &str, value: u64| Part {
-        label: format!("{short}\n{}", group(value)),
+        label: format!("{short}\n{}", compact(value as f32)),
         ..part(r, corners, "", name, value)
     };
     vec![
