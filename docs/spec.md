@@ -165,3 +165,15 @@ Hook cost stays inside the performance budget. On `WM_MOUSEMOVE` (not injected) 
 - Window perf rules still apply: aggregates computed on data change, not per frame.
 
 Done when: `cargo build --release --locked`, `cargo clippy -- -D warnings`, tests pass; README updated (Mouse/Stats tabs, privacy line mentions cursor position heatmap is counts per screen area, never a path or timeline); report lists idle and moving CPU and working set.
+
+### Daily storage (owner, 2026-11-20; task t13)
+
+Owner: an 8 h+ day writes a lot; split files and drop pretty printing. Month shards rewrote ~130 KB each 30 s flush for one changed hour, and every shard was parsed before the window had data.
+
+- **Layout:** `counts/YYYY/MM-DD.json`, one file per local day, same `{ "version": 2, "hours": { "YYYY-MM-DDTHH": Bucket } }` body (version stays 2, the bucket format is unchanged). A flush rewrites only the days that changed, normally today (~4 KB). Same atomic write, corrupt-file (`MM-DD.corrupt-<ts>.json`) and locked-file rules as the month shards.
+- **Compact JSON everywhere:** shards, `keys.json`, `mouse.json`, `settings.json`. No pretty printing.
+- **Startup:** counting never waits on history. Load today's file synchronously (needed for the flush merge), then load every other day file on a background thread and hand the result to the UI. The window shows what it has and fills in when the load finishes; no spinner longer than the load. Totals for the tray tooltip and milestones must not be wrong in the meantime: milestones wait until history is loaded.
+- **Upgrade from v0.1 month shards:** on start, each `counts/YYYY-MM.json` is split into day files, written and verified (re-read and compared), then renamed to `YYYY-MM.json.v1-backup`. Day files that already exist are merged, not overwritten. Crash halfway: the next start re-runs the split from the backup-less shard and merges idempotently (never double count: if a day file already holds the same hours from that shard, skip it; write a marker or compare values to make it idempotent).
+- **Memory/perf:** history is held as now; no new periodic wakeups; idle writes nothing.
+- Tests: day file round trip; flush only touches dirty days; midnight rollover writes both days; month-shard split incl. merge with an existing day file and a crash-resume without double counting; corrupt day file moved aside; background load result equals a synchronous load.
+- Measure with `scripts/perf` (hidden-idle and open-idle, base a26eed1 vs head): startup time to first window frame with 1 year of generated history, and IO bytes per flush.
