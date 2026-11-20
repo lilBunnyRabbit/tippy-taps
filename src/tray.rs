@@ -18,7 +18,7 @@ use windows::core::w;
 
 use crate::clock::Hour;
 use crate::counts::{self, Bucket};
-use crate::{autostart, clock, controller, milestones, settings, storage, ui};
+use crate::{autostart, clock, controller, milestones, overlay, settings, storage, ui};
 
 const CLASS: windows::core::PCWSTR = w!("tippy-taps-instance");
 const WM_SHOW: u32 = WM_APP + 1;
@@ -38,6 +38,8 @@ struct Tray {
     icon: TrayIcon,
     autostart: CheckMenuItem,
     fireworks: CheckMenuItem,
+    rabbit: CheckMenuItem,
+    move_rabbit: CheckMenuItem,
     tooltip: String,
     seen: Option<(u64, Hour, Bucket)>,
 }
@@ -124,11 +126,17 @@ fn build() -> Result<Tray, Box<dyn std::error::Error>> {
     let autostart = CheckMenuItem::new("Start with Windows", true, autostart::enabled(), None);
     let fireworks =
         CheckMenuItem::new("Fireworks at milestones", true, settings::fireworks(), None);
+    let overlay_on = settings::read(|s| s.overlay);
+    let rabbit = CheckMenuItem::new("Show rabbit", true, overlay_on, None);
+    let move_rabbit = CheckMenuItem::new("Move rabbit", overlay_on, overlay::moving(), None);
     let quit = MenuItem::new("Quit", true, None);
     let menu = Menu::with_items(&[
         &open,
         &autostart,
         &fireworks,
+        &PredefinedMenuItem::separator(),
+        &rabbit,
+        &move_rabbit,
         &PredefinedMenuItem::separator(),
         &quit,
     ])?;
@@ -141,10 +149,12 @@ fn build() -> Result<Tray, Box<dyn std::error::Error>> {
         .with_menu_on_left_click(false)
         .build()?;
 
-    let (open_id, autostart_id, fireworks_id, quit_id) = (
+    let (open_id, autostart_id, fireworks_id, rabbit_id, move_id, quit_id) = (
         open.id().clone(),
         autostart.id().clone(),
         fireworks.id().clone(),
+        rabbit.id().clone(),
+        move_rabbit.id().clone(),
         quit.id().clone(),
     );
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
@@ -159,6 +169,13 @@ fn build() -> Result<Tray, Box<dyn std::error::Error>> {
             if let Some(ctx) = CTX.get() {
                 ctx.request_repaint();
             }
+        } else if event.id == rabbit_id {
+            settings::update(|s| s.overlay = !s.overlay);
+            overlay::sync();
+            post(WM_SYNC);
+        } else if event.id == move_id {
+            overlay::set_moving(!overlay::moving());
+            post(WM_SYNC);
         } else if event.id == quit_id {
             post(WM_QUIT_APP);
         }
@@ -178,6 +195,8 @@ fn build() -> Result<Tray, Box<dyn std::error::Error>> {
         icon,
         autostart,
         fireworks,
+        rabbit,
+        move_rabbit,
         tooltip,
         seen: None,
     })
@@ -249,11 +268,19 @@ fn refresh() {
         let seen = (storage::revision(), clock::now_hour(), counts::pending());
         if tray.seen != Some(seen) {
             tray.seen = Some(seen);
-            if milestones::check_storage(seen.2)
-                && ui::shown()
-                && let Some(ctx) = CTX.get()
-            {
-                ctx.request_repaint();
+            if milestones::check_storage(seen.2) {
+                if overlay::visible() {
+                    overlay::cheer();
+                    // Queued shows wait for a window that nobody saw them in; the rabbit did.
+                    if !ui::shown() {
+                        milestones::take_queued();
+                    }
+                }
+                if ui::shown()
+                    && let Some(ctx) = CTX.get()
+                {
+                    ctx.request_repaint();
+                }
             }
             let text = current_tooltip();
             if text != tray.tooltip {
@@ -268,6 +295,17 @@ fn refresh() {
         let on = settings::fireworks();
         if tray.fireworks.is_checked() != on {
             tray.fireworks.set_checked(on);
+        }
+        let on = settings::read(|s| s.overlay);
+        if tray.rabbit.is_checked() != on {
+            tray.rabbit.set_checked(on);
+        }
+        if tray.move_rabbit.is_enabled() != on {
+            tray.move_rabbit.set_enabled(on);
+        }
+        let moving = overlay::moving();
+        if tray.move_rabbit.is_checked() != moving {
+            tray.move_rabbit.set_checked(moving);
         }
     });
 }

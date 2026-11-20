@@ -10,6 +10,7 @@ mod hooks;
 mod keyboard;
 mod layout;
 mod milestones;
+mod overlay;
 mod settings;
 mod stats;
 mod storage;
@@ -42,6 +43,7 @@ fn main() -> eframe::Result {
     let first_run = !dir.exists();
     storage::init(&dir);
     settings::init(&dir);
+    overlay::sync();
     keyboard::init(&dir.join(storage::DIR_NAME));
     autostart::init(first_run);
     hooks::spawn();
