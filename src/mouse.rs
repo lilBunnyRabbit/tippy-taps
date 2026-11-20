@@ -551,7 +551,7 @@ impl Store {
                 version: VERSION,
                 monitors: self.monitors.clone(),
             };
-            match storage::write_json_compact(&self.path, &file) {
+            match storage::write_json(&self.path, &file) {
                 Ok(()) => {
                     self.dirty = false;
                     self.error = None;
@@ -1109,7 +1109,7 @@ mod tests {
                 ("gone".to_string(), Monitor::new(rect(5, 5, 10, 10), 96)),
             ]),
         };
-        storage::write_json_compact(&path, &file).unwrap();
+        storage::write_json(&path, &file).unwrap();
         store.flush("s");
         assert!(store.error.is_none());
 

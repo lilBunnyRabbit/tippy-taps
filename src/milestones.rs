@@ -109,12 +109,12 @@ pub fn check(total: Bucket, played_now: bool) -> bool {
     true
 }
 
-/// Totals are only complete once every shard has loaded; until then a check would celebrate
+/// Totals are only complete once every day file has loaded; until then a check would celebrate
 /// counts that merely reappeared.
 pub fn check_storage(pending: Bucket, played_now: bool) -> bool {
     let total = {
         let storage = storage::get();
-        if storage.saving_blocked() {
+        if !storage.complete() {
             return false;
         }
         let mut total = storage.total;

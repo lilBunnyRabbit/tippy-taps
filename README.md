@@ -29,7 +29,7 @@ What counts:
 
 Input sent by other programs (macros, remote tools, on-screen keyboards) is not counted.
 
-**Privacy:** Counts only. With the keyboard heatmap turned on, it also counts presses per key position. It never records what you typed, the order, or when. The cursor position heatmap is counts per screen area, never a path or a timeline. The counts live in `%APPDATA%\tippy-taps\counts\` (one file per month, plus `keys.json` for the keyboard heatmap and `mouse.json` for the screen areas, beside `settings.json`) and never leave your PC.
+**Privacy:** Counts only. With the keyboard heatmap turned on, it also counts presses per key position. It never records what you typed, the order, or when. The cursor position heatmap is counts per screen area, never a path or a timeline. The counts live in `%APPDATA%\tippy-taps\counts\` (one file per day, `YYYYMM-DD.json`, plus `keys.json` for the keyboard heatmap and `mouse.json` for the screen areas, beside `settings.json`) and never leave your PC.
 
 Counts are saved every 30 seconds and on quit, only when something changed, so a power cut loses at most the last 30 seconds and an idle PC writes nothing.
 

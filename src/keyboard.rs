@@ -333,8 +333,8 @@ mod tests {
 
         store.flush(&taps(&[(0x1e, 3), (0x11c, 1)]), true, "s");
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("\"30\": 3"));
-        assert!(text.contains("\"284\": 1"));
+        assert!(text.contains("\"30\":3"));
+        assert!(text.contains("\"284\":1"));
         std::fs::write(&path, "sentinel").unwrap();
         store.flush(&taps(&[]), true, "s");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "sentinel");
